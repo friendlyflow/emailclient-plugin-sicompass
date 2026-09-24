@@ -1,109 +1,90 @@
 //! Shared IMAP connection helpers used by both `net.rs` (RealImap) and
-//! `idle.rs` (IdleController background task).
+//! `idle.rs` (the IDLE watcher).
 //!
-//! Everything here is async on top of `async-imap` and a process-wide tokio
-//! runtime. The synchronous `Provider` trait is bridged at the `ImapBackend`
-//! call sites via [`block_on`], not here.
+//! Blocking, over TLS: rustls with ring and the webpki roots, so the same code
+//! runs natively and in the sandbox. In the sandbox the TCP connection comes
+//! from the host (`sicompass_pdk::sockets`), which reaches only public servers
+//! on the ports `plugin.json` lists. Every read and write is bounded by
+//! [`IO_TIMEOUT`], so a server that goes silent fails the exchange instead of
+//! holding it forever.
 
 use crate::EmailClientConfig;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::OnceLock;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Runtime
-// ---------------------------------------------------------------------------
-
-/// The process-wide runtime that carries all email I/O.
-///
-/// Multi-threaded on purpose: the folder-list and INBOX-prefetch tasks run
-/// concurrently on it, and [`block_on`] relies on `block_in_place`, which a
-/// current-thread runtime does not support. Mirrors `chromium_runtime()` in
-/// `lib_webbrowser`.
-pub fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("sicompass-email")
-            .build()
-            .expect("failed to build the email runtime")
-    })
-}
-
-/// Drive `fut` to completion from synchronous code.
-///
-/// `Runtime::block_on` panics when called from inside a runtime context, which
-/// the tasks spawned in `lib.rs` do create (the same hazard is documented in
-/// `lib_updater/src/github.rs` and `plugin.rs`). Detect that case and hand the
-/// work to `block_in_place` instead of panicking.
-pub fn block_on<F: Future>(fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => runtime().block_on(fut),
-    }
-}
+/// Upper bound on one read or write on an IMAP or SMTP connection.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
-/// Transport carrying an IMAP session.
+/// Transport carrying an IMAP (or SMTP) session.
 ///
 /// Production traffic is always `Tls`. `Plain` exists so the test suite can
 /// drive `RealImap` against a local fake IMAP server; [`open_stream`] refuses
 /// it for anything that is not a loopback address, so credentials can never
 /// leave the machine in the clear.
-#[derive(Debug)]
 pub enum ImapStream {
-    Tls(Box<async_native_tls::TlsStream<TcpStream>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
     Plain(TcpStream),
 }
 
-impl AsyncRead for ImapStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ImapStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
-            ImapStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+impl std::fmt::Debug for ImapStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ImapStream::Tls(_) => "ImapStream::Tls",
+            ImapStream::Plain(_) => "ImapStream::Plain",
+        })
+    }
+}
+
+impl ImapStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            ImapStream::Tls(s) => s.get_ref(),
+            ImapStream::Plain(s) => s,
         }
     }
 }
 
-impl AsyncWrite for ImapStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            ImapStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
-            ImapStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ImapStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
-            ImapStream::Plain(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ImapStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
-            ImapStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+impl Read for ImapStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ImapStream::Tls(s) => s.read(buf),
+            ImapStream::Plain(s) => s.read(buf),
         }
     }
 }
 
-pub type ImapSession = async_imap::Session<ImapStream>;
+impl Write for ImapStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ImapStream::Tls(s) => s.write(buf),
+            ImapStream::Plain(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ImapStream::Tls(s) => s.flush(),
+            ImapStream::Plain(s) => s.flush(),
+        }
+    }
+}
+
+/// What IDLE uses to wake up now and then (see `idle.rs`).
+impl imap::extensions::idle::SetReadTimeout for ImapStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::Result<()> {
+        self.tcp()
+            .set_read_timeout(timeout)
+            .map_err(imap::Error::Io)
+    }
+}
+
+pub type ImapSession = imap::Session<ImapStream>;
 
 // ---------------------------------------------------------------------------
 // URL parser
@@ -134,90 +115,159 @@ pub fn parse_imap_url(url: &str) -> Option<(String, u16)> {
 
 /// IMAP Authenticator implementing the XOAUTH2 SASL mechanism.
 ///
-/// The `process` method returns the raw SASL initial response (async-imap
-/// base64-encodes it automatically before sending).
+/// The `process` method returns the raw SASL initial response (the `imap`
+/// crate base64-encodes it before sending).
 pub struct XOAuth2Auth {
     pub user: String,
     pub token: String,
 }
 
-impl async_imap::Authenticator for XOAuth2Auth {
+impl imap::Authenticator for XOAuth2Auth {
     type Response = String;
-    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+    fn process(&self, _challenge: &[u8]) -> Self::Response {
         xoauth2_payload(&self.user, &self.token)
     }
 }
 
 /// The raw XOAUTH2 SASL initial response.
 ///
-/// Kept in one place because two callers send it: the `Authenticator` above
-/// (which base64-encodes it for us) and [`RawImap`] (which encodes it itself).
-/// Servers reject any deviation, so the two must not drift apart.
+/// Kept in one place because three callers send it: the `Authenticator` above
+/// (which base64-encodes it for us), [`RawImap`] and SMTP (which encode it
+/// themselves). Servers reject any deviation, so they must not drift apart.
 pub fn xoauth2_payload(user: &str, token: &str) -> String {
     format!("user={user}\x01auth=Bearer {token}\x01\x01")
 }
 
 // ---------------------------------------------------------------------------
-// Session factory
+// Connecting
 // ---------------------------------------------------------------------------
+
+/// The addresses of `host:port`: through the host in the sandbox, which
+/// answers only for public servers on the ports `plugin.json` lists.
+fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    #[cfg(target_arch = "wasm32")]
+    let addrs: Vec<SocketAddr> = sicompass_pdk::sockets::resolve(host, port)?
+        .iter()
+        .filter_map(|a| a.parse::<std::net::IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    #[cfg(not(target_arch = "wasm32"))]
+    let addrs: Vec<SocketAddr> = {
+        use std::net::ToSocketAddrs;
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve {host}:{port}: {e}"))?
+            .collect()
+    };
+    if addrs.is_empty() {
+        Err(format!("cannot resolve {host}:{port}"))
+    } else {
+        Ok(addrs)
+    }
+}
+
+/// Connect to the first of `addrs` that answers, bounded by [`IO_TIMEOUT`].
+fn connect(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
+    let mut last = String::from("no address");
+    for addr in addrs {
+        #[cfg(target_arch = "wasm32")]
+        let attempt = TcpStream::connect(addr);
+        #[cfg(not(target_arch = "wasm32"))]
+        let attempt = TcpStream::connect_timeout(addr, IO_TIMEOUT);
+        match attempt {
+            Ok(tcp) => {
+                // Best effort: a stream that cannot take a timeout still works.
+                let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+                return Ok(tcp);
+            }
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// The TLS client configuration: the webpki roots, safe defaults.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .expect("ring supports the default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
+
+/// TLS over `tcp`, verified for `host`. The handshake runs on first use.
+pub fn tls(host: &str, tcp: TcpStream) -> Result<ImapStream, String> {
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| format!("{host}: {e}"))?;
+    let conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| e.to_string())?;
+    Ok(ImapStream::Tls(Box::new(rustls::StreamOwned::new(
+        conn, tcp,
+    ))))
+}
+
+/// A TLS connection to `host:port` (implicit TLS: IMAPS, SMTPS).
+pub fn open_tls(host: &str, port: u16) -> Result<ImapStream, String> {
+    let tcp = connect(&resolve(host, port)?)?;
+    tls(host, tcp)
+}
+
+/// A plain TCP connection to `host:port`, for a protocol that upgrades it
+/// itself (SMTP's STARTTLS) before anything secret is sent.
+pub fn open_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+    connect(&resolve(host, port)?)
+}
 
 /// Open the transport for `url`.
 ///
 /// `imaps://` performs a TLS handshake. `imap://` stays in the clear and is
 /// therefore only permitted when the resolved address is loopback — the fake
 /// IMAP server in the test suite is the only intended user.
-pub async fn open_stream(url: &str, host: &str, port: u16) -> Result<ImapStream, String> {
-    let addr = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| format!("cannot resolve {host}:{port}"))?;
-
+pub fn open_stream(url: &str, host: &str, port: u16) -> Result<ImapStream, String> {
+    let addrs = resolve(host, port)?;
     let use_tls = url.starts_with("imaps://");
 
     // Decide before opening the socket, so a misconfigured plaintext URL fails
     // fast instead of hanging on a connect to a remote host.
-    if !use_tls && !addr.ip().is_loopback() {
+    if !use_tls && !addrs.iter().all(|a| a.ip().is_loopback()) {
         return Err(format!(
             "refusing to send IMAP credentials in the clear to {host}; use imaps://"
         ));
     }
 
-    let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
-
+    let tcp = connect(&addrs)?;
     if use_tls {
-        let stream = async_native_tls::TlsConnector::new()
-            .connect(host, tcp)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(ImapStream::Tls(Box::new(stream)));
+        return tls(host, tcp);
     }
-
     Ok(ImapStream::Plain(tcp))
 }
 
 /// Open an authenticated IMAP session from `config`.
 ///
 /// Uses XOAUTH2 when an access token is present, LOGIN otherwise.
-pub async fn connect_imap(config: &EmailClientConfig) -> Result<ImapSession, String> {
+pub fn connect_imap(config: &EmailClientConfig) -> Result<ImapSession, String> {
     let (host, port) = parse_imap_url(&config.imap_url)
         .ok_or_else(|| format!("cannot parse IMAP URL: {}", config.imap_url))?;
 
-    let stream = open_stream(&config.imap_url, &host, port).await?;
-
-    // async-imap does not consume the server greeting; unlike the old blocking
-    // `imap::connect` we have to read it ourselves before issuing any command.
-    let mut client = async_imap::Client::new(stream);
-    client
-        .read_response()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "server closed the connection before greeting".to_owned())?;
+    let stream = open_stream(&config.imap_url, &host, port)?;
+    let mut client = imap::Client::new(stream);
+    client.read_greeting().map_err(|e| e.to_string())?;
 
     if config.oauth_access_token.is_empty() {
         client
             .login(&config.username, &config.password)
-            .await
             .map_err(|(e, _)| e.to_string())
     } else {
         let auth = XOAuth2Auth {
@@ -225,22 +275,21 @@ pub async fn connect_imap(config: &EmailClientConfig) -> Result<ImapSession, Str
             token: config.oauth_access_token.clone(),
         };
         client
-            .authenticate("XOAUTH2", auth)
-            .await
+            .authenticate("XOAUTH2", &auth)
             .map_err(|(e, _)| e.to_string())
     }
 }
 
 // ---------------------------------------------------------------------------
-// RawImap — hand-rolled client for commands async-imap cannot decode
+// RawImap — hand-rolled client for commands the `imap` crate cannot decode
 // ---------------------------------------------------------------------------
 
 /// A minimal IMAP client that returns server responses verbatim.
 ///
 /// This exists for exactly one reason: every response line goes through
 /// `imap_proto::parse_response`, and **no released imap-proto understands the
-/// THREAD extension** (verified against 0.10.2, which the old `imap` 2.x crate
-/// used, and 0.16.7, which async-imap uses). `UID THREAD` therefore fails with
+/// THREAD extension** (verified against 0.10.2, which the `imap` 2.x crate used,
+/// and 0.16.7, which async-imap and the `imap` 3 crate use). `UID THREAD` therefore fails with
 /// a parse error before its payload can be read, no matter which wire crate is
 /// underneath, and the crates' raw readers are private.
 ///
@@ -253,7 +302,7 @@ pub async fn connect_imap(config: &EmailClientConfig) -> Result<ImapSession, Str
 /// no longer issues a `SELECT` on the main session, so it cannot disturb the
 /// mailbox that session has selected.
 pub struct RawImap {
-    io: tokio::io::BufReader<ImapStream>,
+    io: BufReader<ImapStream>,
     tag: u32,
     /// Capabilities from the post-authentication `CAPABILITY`, fetched once.
     caps: Option<Vec<String>>,
@@ -262,35 +311,34 @@ pub struct RawImap {
 impl RawImap {
     /// Connect and authenticate, using XOAUTH2 when a token is present and
     /// LOGIN otherwise — the same choice `connect_imap` makes.
-    pub async fn connect(config: &EmailClientConfig) -> Result<Self, String> {
+    pub fn connect(config: &EmailClientConfig) -> Result<Self, String> {
         let (host, port) = parse_imap_url(&config.imap_url)
             .ok_or_else(|| format!("cannot parse IMAP URL: {}", config.imap_url))?;
-        let stream = open_stream(&config.imap_url, &host, port).await?;
+        let stream = open_stream(&config.imap_url, &host, port)?;
 
         let mut raw = RawImap {
-            io: tokio::io::BufReader::new(stream),
+            io: BufReader::new(stream),
             tag: 0,
             caps: None,
         };
 
-        let greeting = raw.read_line().await?;
+        let greeting = raw.read_line()?;
         if !greeting.starts_with("* OK") {
             return Err(format!("unexpected IMAP greeting: {greeting}"));
         }
 
         if config.oauth_access_token.is_empty() {
-            raw.login(&config.username, &config.password).await?;
+            raw.login(&config.username, &config.password)?;
         } else {
-            raw.authenticate_xoauth2(&config.username, &config.oauth_access_token)
-                .await?;
+            raw.authenticate_xoauth2(&config.username, &config.oauth_access_token)?;
         }
         Ok(raw)
     }
 
     /// Cached `CAPABILITY` keywords, upper-cased.
-    pub async fn capabilities(&mut self) -> Result<&[String], String> {
+    pub fn capabilities(&mut self) -> Result<&[String], String> {
         if self.caps.is_none() {
-            let lines = self.command("CAPABILITY").await?;
+            let lines = self.command("CAPABILITY")?;
             let caps = lines
                 .iter()
                 .find_map(|l| l.strip_prefix("* CAPABILITY "))
@@ -303,26 +351,22 @@ impl RawImap {
 
     /// `SELECT` then `UID THREAD <algo> UTF-8 ALL`, returning the raw response
     /// lines for [`crate::net::parse_thread_response`].
-    pub async fn uid_thread(&mut self, folder: &str, algo: &str) -> Result<String, String> {
-        self.command(&format!("SELECT {}", quote(folder))).await?;
-        let lines = self
-            .command(&format!("UID THREAD {algo} UTF-8 ALL"))
-            .await?;
+    pub fn uid_thread(&mut self, folder: &str, algo: &str) -> Result<String, String> {
+        self.command(&format!("SELECT {}", quote(folder)))?;
+        let lines = self.command(&format!("UID THREAD {algo} UTF-8 ALL"))?;
         Ok(lines.join("\r\n"))
     }
 
-    async fn login(&mut self, user: &str, password: &str) -> Result<(), String> {
-        self.command(&format!("LOGIN {} {}", quote(user), quote(password)))
-            .await?;
+    fn login(&mut self, user: &str, password: &str) -> Result<(), String> {
+        self.command(&format!("LOGIN {} {}", quote(user), quote(password)))?;
         Ok(())
     }
 
-    async fn authenticate_xoauth2(&mut self, user: &str, token: &str) -> Result<(), String> {
+    fn authenticate_xoauth2(&mut self, user: &str, token: &str) -> Result<(), String> {
         let tag = self.next_tag();
-        self.write(&format!("{tag} AUTHENTICATE XOAUTH2\r\n"))
-            .await?;
+        self.write(&format!("{tag} AUTHENTICATE XOAUTH2\r\n"))?;
 
-        let cont = self.read_line().await?;
+        let cont = self.read_line()?;
         if !cont.starts_with('+') {
             return Err(format!("server refused XOAUTH2: {cont}"));
         }
@@ -331,23 +375,23 @@ impl RawImap {
             &base64::engine::general_purpose::STANDARD,
             xoauth2_payload(user, token),
         );
-        self.write(&format!("{payload}\r\n")).await?;
-        self.read_tagged(&tag).await?;
+        self.write(&format!("{payload}\r\n"))?;
+        self.read_tagged(&tag)?;
         Ok(())
     }
 
     /// Run one command and return its untagged (`*`) response lines.
-    async fn command(&mut self, cmd: &str) -> Result<Vec<String>, String> {
+    fn command(&mut self, cmd: &str) -> Result<Vec<String>, String> {
         let tag = self.next_tag();
-        self.write(&format!("{tag} {cmd}\r\n")).await?;
-        self.read_tagged(&tag).await
+        self.write(&format!("{tag} {cmd}\r\n"))?;
+        self.read_tagged(&tag)
     }
 
     /// Collect untagged lines until the tagged completion for `tag`.
-    async fn read_tagged(&mut self, tag: &str) -> Result<Vec<String>, String> {
+    fn read_tagged(&mut self, tag: &str) -> Result<Vec<String>, String> {
         let mut untagged = Vec::new();
         loop {
-            let line = self.read_line().await?;
+            let line = self.read_line()?;
             match line.strip_prefix(&format!("{tag} ")) {
                 Some(status) if status.starts_with("OK") => return Ok(untagged),
                 Some(status) => return Err(status.to_owned()),
@@ -358,23 +402,20 @@ impl RawImap {
 
     fn next_tag(&mut self) -> String {
         self.tag += 1;
-        // A distinct prefix from async-imap's, so a stray response is obvious
-        // in a packet capture.
+        // A distinct prefix from the `imap` crate's, so a stray response is
+        // obvious in a packet capture.
         format!("t{}", self.tag)
     }
 
-    async fn write(&mut self, s: &str) -> Result<(), String> {
+    fn write(&mut self, s: &str) -> Result<(), String> {
         let stream = self.io.get_mut();
-        stream
-            .write_all(s.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())
+        stream.write_all(s.as_bytes()).map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())
     }
 
-    async fn read_line(&mut self) -> Result<String, String> {
+    fn read_line(&mut self) -> Result<String, String> {
         let mut buf = Vec::new();
-        match self.io.read_until(b'\n', &mut buf).await {
+        match self.io.read_until(b'\n', &mut buf) {
             Ok(0) => Err("connection closed by server".to_owned()),
             Ok(_) => {
                 while matches!(buf.last(), Some(b'\r') | Some(b'\n')) {
@@ -399,7 +440,7 @@ fn quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_imap::Authenticator;
+    use imap::Authenticator;
 
     #[test]
     fn test_parse_imap_url_with_port() {
@@ -432,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_xoauth2_process_builds_sasl_payload() {
-        let mut auth = XOAuth2Auth {
+        let auth = XOAuth2Auth {
             user: "user@example.com".to_owned(),
             token: "tok123".to_owned(),
         };
@@ -445,12 +486,11 @@ mod tests {
     /// Plaintext IMAP must never be attempted against a remote host, or the
     /// login credentials would go out in the clear. The refusal happens before
     /// any socket is opened, so this test never touches the network.
-    #[tokio::test]
-    async fn test_plaintext_to_non_loopback_is_refused() {
+    #[test]
+    fn test_plaintext_to_non_loopback_is_refused() {
         // 198.51.100.0/24 is TEST-NET-2 (RFC 5737): reserved for documentation
-        // and never routable, so `lookup_host` resolves it locally.
+        // and never routable, so `lookup_host` resolves it without a lookup.
         let err = open_stream("imap://198.51.100.7", "198.51.100.7", 143)
-            .await
             .expect_err("plaintext to a remote host must be refused");
         assert!(
             err.contains("in the clear"),
@@ -460,12 +500,11 @@ mod tests {
 
     /// The loopback carve-out must not weaken `imaps://` — TLS is used for
     /// loopback too, so a local fake server cannot downgrade a secure config.
-    #[tokio::test]
-    async fn test_imaps_to_loopback_still_attempts_tls() {
+    #[test]
+    fn test_imaps_to_loopback_still_attempts_tls() {
         // Nothing is listening, so this fails at connect; the point is that it
         // never reports the plaintext refusal, i.e. it took the TLS branch.
         let err = open_stream("imaps://127.0.0.1", "127.0.0.1", 1)
-            .await
             .expect_err("nothing listens on port 1");
         assert!(
             !err.contains("in the clear"),

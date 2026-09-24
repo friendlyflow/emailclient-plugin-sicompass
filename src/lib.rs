@@ -1,9 +1,10 @@
-//! Email client provider — Rust port of `lib_emailclient/`.
+//! Email client, a sicompass WASM plugin — Rust port of `lib_emailclient/`.
 //!
-//! Implements the [`Provider`] trait for IMAP/SMTP email access.
+//! Implements the pdk's `Plugin` for IMAP/SMTP email access.
 //! IMAP and SMTP operations are injected via the [`ImapBackend`] and
 //! [`SmtpBackend`] traits, making the provider fully unit-testable.
-//! Real network backends live in `net`, OAuth2 in `oauth2`, IDLE in `idle`.
+//! Real network backends live in `net`, OAuth2 in `oauth2`, IDLE in `idle`,
+//! and the background task that runs them in the sandbox in `worker`.
 //!
 //! ## FFON tree layout
 //!
@@ -45,38 +46,26 @@
 
 pub mod cache;
 pub mod connection;
+// The wire tests against a fake IMAP server. In the crate rather than in
+// `tests/`, which could not link a cdylib.
+#[cfg(test)]
+mod fake_imap_tests;
+mod files;
+mod http;
 pub mod idle;
+mod localize;
 pub mod net;
 pub mod oauth2;
+mod worker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-// The `Provider` trait is synchronous, so every `ImapBackend` / `SmtpBackend`
-// call is bridged here. `block_on` detects an ambient runtime and uses
-// `block_in_place` rather than panicking, which matters for the tasks spawned
-// below.
-use crate::connection::block_on;
-
+use sicompass_pdk::{Descriptor, Plugin, PollResult, ProviderOp, export_plugin};
 use sicompass_sdk::ffon::{FfonElement, FfonObject};
-use sicompass_sdk::localize;
-use std::sync::OnceLock as TranslationsOnce;
-
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: TranslationsOnce<()> = TranslationsOnce::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 use sicompass_sdk::placeholders::{I_PLACEHOLDER, new_obj_with_i_placeholder, seed_i_placeholders};
-use sicompass_sdk::platform;
-use sicompass_sdk::provider::Provider;
-use sicompass_sdk::timeline::{ImapOpKind, TimelineEntry};
+use sicompass_sdk::provider::{ListItem, SearchResultItem};
+use sicompass_sdk::timeline::ImapOpKind;
 
 use idle::IdleController;
 
@@ -97,6 +86,36 @@ pub enum MailBody {
 impl Default for MailBody {
     fn default() -> Self {
         MailBody::Text(String::new())
+    }
+}
+
+/// A body crosses to and from the worker as text, or as FFON's JSON.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum MailBodyWire {
+    Text(String),
+    Ffon(String),
+}
+
+impl serde::Serialize for MailBody {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            MailBody::Text(t) => MailBodyWire::Text(t.clone()),
+            MailBody::Ffon(elems) => MailBodyWire::Ffon(
+                sicompass_sdk::ffon::to_json_string(elems).map_err(serde::ser::Error::custom)?,
+            ),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MailBody {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match MailBodyWire::deserialize(d)? {
+            MailBodyWire::Text(t) => MailBody::Text(t),
+            MailBodyWire::Ffon(json) => MailBody::Ffon(
+                sicompass_sdk::ffon::parse_json(&json).map_err(serde::de::Error::custom)?,
+            ),
+        })
     }
 }
 
@@ -142,7 +161,7 @@ pub(crate) fn flatten_ffon_to_text(elems: &[FfonElement]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Config mirroring `EmailClientConfig` from `emailclient.h`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EmailClientConfig {
     pub imap_url: String,
     pub smtp_url: String,
@@ -156,7 +175,7 @@ pub struct EmailClientConfig {
 }
 
 /// A single mailbox entry returned by `ImapBackend::list_folders`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FolderInfo {
     /// Full IMAP folder name, e.g. `[Gmail]/Trash`.
     pub name: String,
@@ -179,7 +198,7 @@ struct SpecialFolders {
 }
 
 /// A summarised message header (from IMAP ENVELOPE + FLAGS).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MessageHeader {
     /// IMAP UID
     pub uid: u32,
@@ -200,15 +219,32 @@ pub struct MessageHeader {
 }
 
 /// A file attached to a received message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmailAttachment {
     pub filename: String,
     pub content_type: String,
+    /// Base64 on its way to and from the worker, not a JSON array of numbers.
+    #[serde(with = "base64_bytes")]
     pub data: Vec<u8>,
 }
 
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A fully fetched email message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EmailMessage {
     pub uid: u32,
     pub from: String,
@@ -262,30 +298,21 @@ struct ComposeState {
 // ---------------------------------------------------------------------------
 
 /// IMAP backend — all operations used by the provider.
-#[async_trait::async_trait]
 pub trait ImapBackend: Send {
     /// List all selectable folders with their SPECIAL-USE attributes.
-    async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String>;
+    fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String>;
     /// Fetch headers (including flags) for the most recent `limit` messages in `folder`.
-    async fn list_messages(
-        &mut self,
-        folder: &str,
-        limit: usize,
-    ) -> Result<Vec<MessageHeader>, String>;
+    fn list_messages(&mut self, folder: &str, limit: usize) -> Result<Vec<MessageHeader>, String>;
     /// Fetch the full content of a message by UID.
-    async fn fetch_message(
-        &mut self,
-        folder: &str,
-        uid: u32,
-    ) -> Result<Option<EmailMessage>, String>;
+    fn fetch_message(&mut self, folder: &str, uid: u32) -> Result<Option<EmailMessage>, String>;
     /// Fetch a message by its Message-ID header via IMAP SEARCH.
-    async fn fetch_message_by_message_id(
+    fn fetch_message_by_message_id(
         &mut self,
         folder: &str,
         message_id: &str,
     ) -> Result<Option<EmailMessage>, String>;
     /// Add/remove IMAP flags on a message (e.g. `\\Seen`, `\\Flagged`, `\\Deleted`).
-    async fn set_flags(
+    fn set_flags(
         &mut self,
         folder: &str,
         uid: u32,
@@ -293,26 +320,27 @@ pub trait ImapBackend: Send {
         remove: &[&str],
     ) -> Result<(), String>;
     /// Copy a message to another folder (server-side COPY).
-    async fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
+    fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
     /// Move a message to another folder (MOVE extension; falls back to COPY+DELETE+EXPUNGE).
-    async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
+    fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
     /// Expunge a specific UID from a folder (UIDPLUS UID EXPUNGE).
-    async fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String>;
+    fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String>;
     /// Append a raw RFC 2822 message to a folder (IMAP APPEND).
-    async fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String>;
+    fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String>;
     /// Fetch the UID thread map for `folder` using the IMAP THREAD extension.
     ///
     /// Returns `Some(threads)` where each inner `Vec<u32>` is the flat list of
     /// UIDs belonging to the same thread.  Returns `None` when the server does
     /// not advertise `THREAD=REFERENCES` capability.
-    async fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String>;
+    fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String>;
 }
 
 /// SMTP backend — send an email message.
 /// Returns the raw RFC 2822 bytes of the sent message (for IMAP APPEND to Sent).
-#[async_trait::async_trait]
 pub trait SmtpBackend: Send {
-    async fn send(
+    // One argument per part of the message, as the compose form has them.
+    #[allow(clippy::too_many_arguments)]
+    fn send(
         &mut self,
         from: &str,
         to: &[&str],
@@ -373,7 +401,10 @@ fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) {
     let Ok(json) = serde_json::to_string_pretty(value) else {
         return;
     };
-    let _ = platform::atomic_write(path, &json);
+    if let Some(parent) = path.parent() {
+        files::make_dirs(parent);
+    }
+    let _ = files::atomic_write(path, &json);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +419,24 @@ fn folder_display_name(imap_name: &str) -> &str {
         Some(idx) => &imap_name[idx + 1..],
         None => imap_name,
     }
+}
+
+/// A folder's rows: one per message, then "Load more…" when the list may go
+/// on.
+fn envelope_items(headers: &[MessageHeader], limit: usize) -> Vec<FfonElement> {
+    let mut items: Vec<FfonElement> = headers
+        .iter()
+        .map(|h| FfonElement::new_obj(message_label(h)))
+        .collect();
+    if items.is_empty() {
+        items.push(FfonElement::new_str("(no messages)".to_owned()));
+    }
+    if headers.len() >= limit {
+        items.push(FfonElement::new_str(
+            "<button>load-more</button>Load more…".to_owned(),
+        ));
+    }
+    items
 }
 
 /// Compute the FFON label for a message header.
@@ -487,12 +536,14 @@ pub struct EmailClientProvider {
 
     // Async folder fetch — moves list_folders() off the main thread at startup.
     folder_fetch_inflight: Arc<AtomicBool>,
+    #[allow(clippy::type_complexity)]
     folder_fetch_result: Arc<Mutex<Option<Result<Vec<FolderInfo>, String>>>>,
     // Disabled in tests that inject a mock via with_imap() so they keep using the sync path.
     async_folder_fetch_enabled: bool,
 
     // Parallel INBOX prefetch — started alongside the folder list fetch so
     // navigating into INBOX doesn't need a second cold-start round-trip.
+    #[allow(clippy::type_complexity)]
     inbox_prefetch_result: Arc<Mutex<Option<Result<Vec<MessageHeader>, String>>>>,
 
     // ---- Non-blocking IMAP operations ------------------------------------
@@ -510,7 +561,8 @@ pub struct EmailClientProvider {
     // per operation would cost a TCP + TLS + login round-trip on every message
     // open — worse than the blocking this replaces. The render thread never
     // touches it; only spawned tasks do.
-    bg_imap: Option<Arc<tokio::sync::Mutex<crate::net::RealImap>>>,
+    /// The background worker (see `worker.rs`), started on first use.
+    worker: Option<worker::Worker>,
 
     // Message body fetch (opening a message).
     message_fetch_inflight: Arc<AtomicBool>,
@@ -588,6 +640,7 @@ pub struct EmailClientProvider {
     // Async OAuth token refresh — moves oauth2::refresh_token() off the main thread at startup.
     // Result carries (new_access_token, new_token_expiry) on success.
     token_refresh_inflight: Arc<AtomicBool>,
+    #[allow(clippy::type_complexity)]
     token_refresh_result: Arc<Mutex<Option<Result<(String, i64), String>>>>,
 
     // Pending error message to surface via take_error.
@@ -595,7 +648,7 @@ pub struct EmailClientProvider {
 
     // Unified-timeline emission queue. Each undoable IMAP command pushes a
     // typed `ImapOp` here, drained by the app via `take_timeline_entries`.
-    pending_timeline_entries: Vec<TimelineEntry>,
+    pending_timeline_entries: Vec<ProviderOp>,
 
     // In-flight OAuth2 login handle (None when no login is in progress).
     active_login: Option<oauth2::PendingAuthorize>,
@@ -606,7 +659,8 @@ pub struct EmailClientProvider {
 }
 
 /// One entry in the History view: either already known, or a fetch to make.
-enum HistoryItem {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum HistoryItem {
     Label(String),
     FetchUid(u32),
     FetchMessageId(String),
@@ -623,43 +677,7 @@ enum MessageState {
     Missing,
 }
 
-/// A mutation dispatched to the background runtime.
-///
-/// Modelled as data rather than a closure so the spawn site stays one function
-/// and each variant carries owned arguments across the task boundary.
-enum BgOp {
-    SetFlags {
-        folder: String,
-        uid: u32,
-        add: Vec<String>,
-        remove: Vec<String>,
-    },
-    Move {
-        folder: String,
-        uid: u32,
-        dest: String,
-    },
-    Expunge {
-        folder: String,
-        uid: u32,
-    },
-    Append {
-        folder: String,
-        message: Vec<u8>,
-    },
-}
-
-impl BgOp {
-    /// Prefix for the user-facing error when the operation fails.
-    fn label(&self) -> &'static str {
-        match self {
-            BgOp::SetFlags { .. } => "flag update failed",
-            BgOp::Move { .. } => "move failed",
-            BgOp::Expunge { .. } => "delete failed",
-            BgOp::Append { .. } => "save failed",
-        }
-    }
-}
+use worker::BgOp;
 
 impl EmailClientProvider {
     pub fn new() -> Self {
@@ -691,7 +709,7 @@ impl EmailClientProvider {
             folder_fetch_result: Arc::new(Mutex::new(None)),
             async_folder_fetch_enabled: true,
             inbox_prefetch_result: Arc::new(Mutex::new(None)),
-            bg_imap: None,
+            worker: None,
             message_fetch_inflight: Arc::new(AtomicBool::new(false)),
             message_fetch_result: Arc::new(Mutex::new(None)),
             message_fetch_key: None,
@@ -721,14 +739,94 @@ impl EmailClientProvider {
 
     // ---- Non-blocking IMAP plumbing -----------------------------------------
 
-    /// The shared background connection, opened on first use.
-    fn bg_imap(&mut self) -> Arc<tokio::sync::Mutex<crate::net::RealImap>> {
-        if self.bg_imap.is_none() {
-            self.bg_imap = Some(Arc::new(tokio::sync::Mutex::new(
-                crate::net::RealImap::from_config(&self.config),
-            )));
+    /// Hand `job` to the worker, starting it on first use. A worker that
+    /// cannot start reports why, the way a failed job would.
+    fn send_to_worker(&mut self, job: worker::Job) {
+        if self.worker.is_none() {
+            match worker::Worker::start(&self.config) {
+                Ok(w) => self.worker = Some(w),
+                Err(e) => {
+                    self.bg_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("IMAP error: {e}"));
+                    self.bg_completed.store(true, Ordering::Release);
+                    return;
+                }
+            }
         }
-        Arc::clone(self.bg_imap.as_ref().expect("opened above"))
+        if let Some(w) = &self.worker
+            && let Err(e) = w.send(&job)
+        {
+            self.worker = None;
+            self.bg_errors
+                .lock()
+                .unwrap()
+                .push(format!("IMAP error: {e}"));
+            self.bg_completed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Put what the worker finished where the rendering code looks for it,
+    /// and ask for a render.
+    fn apply_done(&mut self, done: worker::Done) {
+        use worker::Done;
+        match done {
+            Done::Root { folders, inbox } => {
+                *self.folder_fetch_result.lock().unwrap() = Some(folders);
+                *self.inbox_prefetch_result.lock().unwrap() = Some(inbox);
+                // Clear inflight before raising the refresh flag, so the render
+                // cannot observe "done but still in flight".
+                self.folder_fetch_inflight.store(false, Ordering::Release);
+            }
+            Done::Envelopes {
+                folder,
+                limit,
+                result,
+            } => *self.envelope_fetch_result.lock().unwrap() = Some((folder, limit, result)),
+            Done::Threads { folder, threads } => {
+                *self.thread_fetch_result.lock().unwrap() = Some((folder, threads))
+            }
+            Done::Message {
+                folder,
+                uid,
+                result,
+            } => {
+                *self.message_fetch_result.lock().unwrap() = Some((folder, uid, result));
+                self.message_fetch_inflight.store(false, Ordering::Release);
+            }
+            Done::History { key, labels } => {
+                *self.history_fetch_result.lock().unwrap() = Some((key, labels))
+            }
+            Done::Op { label, error } => {
+                // Re-render either way: on success the optimistic local state
+                // is confirmed, on failure the error needs to reach the user.
+                if let Some(e) = error {
+                    self.bg_errors.lock().unwrap().push(format!("{label}: {e}"));
+                }
+            }
+            Done::Sent { result } => {
+                *self.send_result.lock().unwrap() = Some(result);
+                self.send_inflight.store(false, Ordering::Release);
+            }
+            Done::Token { result } => {
+                *self.token_refresh_result.lock().unwrap() = Some(result);
+                self.token_refresh_inflight.store(false, Ordering::Release);
+            }
+        }
+        self.bg_completed.store(true, Ordering::Release);
+    }
+
+    /// Apply what the native worker finished (in the sandbox answers come
+    /// through `on_task_event`).
+    fn drain_worker(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let done = self.worker.as_ref().map(|w| w.drain()).unwrap_or_default();
+            for d in done {
+                self.apply_done(d);
+            }
+        }
     }
 
     /// Drop the background connection so the next operation reconnects.
@@ -737,7 +835,10 @@ impl EmailClientProvider {
     /// config change — since the open connection authenticated with the old
     /// credentials.
     fn reset_bg_imap(&mut self) {
-        self.bg_imap = None;
+        if self.worker.is_some() {
+            let config = self.config.clone();
+            self.send_to_worker(worker::Job::Configure(config));
+        }
     }
 
     /// Whether IMAP work should run in the background.
@@ -750,36 +851,9 @@ impl EmailClientProvider {
         self.async_folder_fetch_enabled
     }
 
-    /// Run `op` on the shared runtime, recording any error for `take_error`.
+    /// Hand a write to the worker, recording any error for `take_error`.
     fn spawn_bg_op(&mut self, op: BgOp) {
-        let imap = self.bg_imap();
-        let errors = Arc::clone(&self.bg_errors);
-        let bg_done = Arc::clone(&self.bg_completed);
-
-        crate::connection::runtime().spawn(async move {
-            let mut guard = imap.lock().await;
-            let result = match &op {
-                BgOp::SetFlags {
-                    folder,
-                    uid,
-                    add,
-                    remove,
-                } => {
-                    let add_refs: Vec<&str> = add.iter().map(String::as_str).collect();
-                    let remove_refs: Vec<&str> = remove.iter().map(String::as_str).collect();
-                    guard.set_flags(folder, *uid, &add_refs, &remove_refs).await
-                }
-                BgOp::Move { folder, uid, dest } => guard.move_message(folder, *uid, dest).await,
-                BgOp::Expunge { folder, uid } => guard.expunge_uid(folder, *uid).await,
-                BgOp::Append { folder, message } => guard.append(folder, message).await,
-            };
-            if let Err(e) = result {
-                errors.lock().unwrap().push(format!("{}: {e}", op.label()));
-            }
-            // Re-render either way: on success the optimistic local state is
-            // confirmed, on failure the error needs to reach the user.
-            bg_done.store(true, Ordering::Release);
-        });
+        self.send_to_worker(worker::Job::Op(op));
     }
 
     /// Resolve the body for `(folder, uid)`, fetching in the background.
@@ -790,12 +864,12 @@ impl EmailClientProvider {
     /// the existing tests see unchanged behaviour.
     fn resolve_message(&mut self, real_folder: &str, uid: u32) -> MessageState {
         if !self.bg_enabled() {
-            if let Some(ref mut imap) = self.imap {
-                if let Ok(Some(m)) = block_on(imap.fetch_message(real_folder, uid)) {
-                    self.message_detail = Some(m.clone());
-                    self.message_detail_folder = real_folder.to_owned();
-                    return MessageState::Ready(Box::new(m));
-                }
+            if let Some(ref mut imap) = self.imap
+                && let Ok(Some(m)) = imap.fetch_message(real_folder, uid)
+            {
+                self.message_detail = Some(m.clone());
+                self.message_detail_folder = real_folder.to_owned();
+                return MessageState::Ready(Box::new(m));
             }
             // Fall back to cached detail if available.
             return match self.message_detail.clone() {
@@ -808,23 +882,24 @@ impl EmailClientProvider {
         // path being rendered is dropped: the user navigated on while it was
         // in flight.
         let done = self.message_fetch_result.lock().unwrap().take();
-        if let Some((folder, fetched_uid, result)) = done {
-            if folder == real_folder && fetched_uid == uid {
-                self.message_fetch_key = None;
-                match result {
-                    Ok(Some(m)) => {
-                        self.message_detail = Some(m);
-                        self.message_detail_folder = folder;
-                    }
-                    Ok(None) => return MessageState::Missing,
-                    Err(e) => {
-                        self.bg_errors
-                            .lock()
-                            .unwrap()
-                            .push(format!("IMAP error: {e}"));
-                        self.message_fetch_failed = Some(((real_folder.to_owned(), uid), e));
-                        // Fall through: a stale body beats an empty screen.
-                    }
+        if let Some((folder, fetched_uid, result)) = done
+            && folder == real_folder
+            && fetched_uid == uid
+        {
+            self.message_fetch_key = None;
+            match result {
+                Ok(Some(m)) => {
+                    self.message_detail = Some(m);
+                    self.message_detail_folder = folder;
+                }
+                Ok(None) => return MessageState::Missing,
+                Err(e) => {
+                    self.bg_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("IMAP error: {e}"));
+                    self.message_fetch_failed = Some(((real_folder.to_owned(), uid), e));
+                    // Fall through: a stale body beats an empty screen.
                 }
             }
         }
@@ -861,22 +936,31 @@ impl EmailClientProvider {
         MessageState::Loading
     }
 
+    /// The cached messages of the open folder were changed here (a flag, a
+    /// message moved away), so its rows must follow.
+    ///
+    /// On the synchronous path the list is simply fetched again. In the
+    /// background it is rebuilt from what changed: fetching it again would
+    /// show "Loading…" in place of the folder until the server answers, and
+    /// the change the server is still carrying out is already known.
+    fn envelopes_changed(&mut self) {
+        if self.bg_enabled() && self.envelope_cache.is_some() {
+            let limit = *self
+                .folder_limits
+                .get(&self.envelope_cache_folder)
+                .unwrap_or(&50);
+            self.envelope_cache = Some(envelope_items(&self.message_cache, limit));
+        } else {
+            self.envelope_cache = None;
+        }
+    }
+
     /// Fetch a folder's envelope list in the background.
     fn spawn_envelope_fetch(&mut self, folder: &str, limit: usize) {
-        let imap = self.bg_imap();
-        let slot = Arc::clone(&self.envelope_fetch_result);
-        let bg_done = Arc::clone(&self.bg_completed);
-        let folder_owned = folder.to_owned();
-
-        self.envelope_fetch_key = Some((folder_owned.clone(), limit));
-
-        crate::connection::runtime().spawn(async move {
-            let result = {
-                let mut guard = imap.lock().await;
-                guard.list_messages(&folder_owned, limit).await
-            };
-            *slot.lock().unwrap() = Some((folder_owned, limit, result));
-            bg_done.store(true, Ordering::Release);
+        self.envelope_fetch_key = Some((folder.to_owned(), limit));
+        self.send_to_worker(worker::Job::Envelopes {
+            folder: folder.to_owned(),
+            limit,
         });
     }
 
@@ -885,53 +969,24 @@ impl EmailClientProvider {
     /// Nothing waits on this: until it lands, History uses the References
     /// fallback, exactly as it does against a server with no THREAD support.
     fn spawn_thread_fetch(&mut self, folder: &str) {
-        let imap = self.bg_imap();
-        let slot = Arc::clone(&self.thread_fetch_result);
-        let bg_done = Arc::clone(&self.bg_completed);
-        let folder_owned = folder.to_owned();
-
-        self.thread_fetch_key = Some(folder_owned.clone());
-
-        crate::connection::runtime().spawn(async move {
-            let result = {
-                let mut guard = imap.lock().await;
-                guard.fetch_threads(&folder_owned).await
-            };
-            // A THREAD failure is non-fatal and already covered by the
-            // References path, so it is recorded as "no map", not an error.
-            *slot.lock().unwrap() = Some((folder_owned, result.ok().flatten()));
-            bg_done.store(true, Ordering::Release);
+        self.thread_fetch_key = Some(folder.to_owned());
+        self.send_to_worker(worker::Job::Threads {
+            folder: folder.to_owned(),
         });
     }
 
     /// Fetch a message body in the background.
     fn spawn_message_fetch(&mut self, folder: &str, uid: u32) {
-        let imap = self.bg_imap();
-        let slot = Arc::clone(&self.message_fetch_result);
-        let inflight = Arc::clone(&self.message_fetch_inflight);
-        let bg_done = Arc::clone(&self.bg_completed);
-        let folder_owned = folder.to_owned();
-
-        self.message_fetch_key = Some((folder_owned.clone(), uid));
-        inflight.store(true, Ordering::Release);
-
-        crate::connection::runtime().spawn(async move {
-            let result = {
-                let mut guard = imap.lock().await;
-                guard.fetch_message(&folder_owned, uid).await
-            };
-            *slot.lock().unwrap() = Some((folder_owned, uid, result));
-            inflight.store(false, Ordering::Release);
-            bg_done.store(true, Ordering::Release);
+        self.message_fetch_key = Some((folder.to_owned(), uid));
+        self.message_fetch_inflight.store(true, Ordering::Release);
+        self.send_to_worker(worker::Job::Message {
+            folder: folder.to_owned(),
+            uid,
         });
     }
 
     fn push_imap_op(&mut self, op: ImapOpKind) {
-        self.pending_timeline_entries.push(TimelineEntry::ImapOp {
-            provider_idx: 0, // patched by app
-            id: sicompass_sdk::ffon::IdArray::new(),
-            op,
-        });
+        self.pending_timeline_entries.push(encode_op(&op));
     }
 
     /// Override the settings.json path (used in tests to avoid touching real config).
@@ -943,7 +998,7 @@ impl EmailClientProvider {
     fn config_path(&self) -> Option<std::path::PathBuf> {
         self.config_path_override
             .clone()
-            .or_else(|| platform::main_config_path())
+            .or_else(default_state_path)
     }
 
     /// Inject an IMAP backend (used in tests and production setup).
@@ -1042,7 +1097,11 @@ impl EmailClientProvider {
     /// Apply an `ImapOpKind` for undo (`is_undo = true`) or redo
     /// (`is_undo = false`). Mirrors `apply_provider_command` but operates on
     /// the typed enum instead of a JSON payload.
-    async fn apply_imap_op(&mut self, op: &ImapOpKind, is_undo: bool, error: &mut String) {
+    fn apply_imap_op(&mut self, op: &ImapOpKind, is_undo: bool, error: &mut String) {
+        if self.bg_enabled() {
+            self.apply_imap_op_in_background(op, is_undo);
+            return;
+        }
         let imap = match self.imap.as_mut() {
             Some(i) => i,
             None => {
@@ -1072,9 +1131,9 @@ impl EmailClientProvider {
                 } else {
                     (src_folder.as_str(), trash_folder.as_str())
                 };
-                match imap.fetch_message_by_message_id(search_in, msg_id).await {
+                match imap.fetch_message_by_message_id(search_in, msg_id) {
                     Ok(Some(msg)) => {
-                        if let Err(e) = imap.move_message(search_in, msg.uid, move_to).await {
+                        if let Err(e) = imap.move_message(search_in, msg.uid, move_to) {
                             let mut args = localize::Args::new();
                             args.set("label", label.to_owned());
                             args.set("err", e.to_string());
@@ -1110,7 +1169,7 @@ impl EmailClientProvider {
                 } else {
                     (&[], &["\\Seen"])
                 };
-                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove).await {
+                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove) {
                     let mut args = localize::Args::new();
                     args.set("label", label.to_owned());
                     args.set("err", e.to_string());
@@ -1134,7 +1193,7 @@ impl EmailClientProvider {
                 } else {
                     (&[], &["\\Flagged"])
                 };
-                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove).await {
+                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove) {
                     let mut args = localize::Args::new();
                     args.set("label", label.to_owned());
                     args.set("err", e.to_string());
@@ -1145,6 +1204,76 @@ impl EmailClientProvider {
                     }
                     self.envelope_cache = None;
                 }
+            }
+        }
+    }
+
+    /// `apply_imap_op` through the worker: the local state changes at once,
+    /// the server follows, and a failure is reported like any other write's.
+    fn apply_imap_op_in_background(&mut self, op: &ImapOpKind, is_undo: bool) {
+        match op {
+            ImapOpKind::Trash {
+                msg_id,
+                src_folder,
+                trash_folder: other,
+            }
+            | ImapOpKind::Archive {
+                msg_id,
+                src_folder,
+                archive_folder: other,
+            }
+            | ImapOpKind::Move {
+                msg_id,
+                src_folder,
+                dst_folder: other,
+            } => {
+                let (search_in, dest) = if is_undo {
+                    (other.clone(), src_folder.clone())
+                } else {
+                    (src_folder.clone(), other.clone())
+                };
+                self.spawn_bg_op(BgOp::MoveByMessageId {
+                    search_in,
+                    msg_id: msg_id.clone(),
+                    dest,
+                });
+                self.envelope_cache = None;
+                self.message_cache.clear();
+            }
+            ImapOpKind::SetSeen {
+                msg_uid,
+                folder,
+                prev,
+                new,
+            }
+            | ImapOpKind::SetFlagged {
+                msg_uid,
+                folder,
+                prev,
+                new,
+            } => {
+                let seen = matches!(op, ImapOpKind::SetSeen { .. });
+                let flag = if seen { "\\Seen" } else { "\\Flagged" };
+                let target = if is_undo { *prev } else { *new };
+                let (add, remove) = if target {
+                    (vec![flag.to_owned()], Vec::new())
+                } else {
+                    (Vec::new(), vec![flag.to_owned()])
+                };
+                self.spawn_bg_op(BgOp::SetFlags {
+                    folder: folder.clone(),
+                    uid: *msg_uid,
+                    add,
+                    remove,
+                });
+                if let Some(h) = self.message_cache.iter_mut().find(|h| h.uid == *msg_uid) {
+                    if seen {
+                        h.seen = target;
+                    } else {
+                        h.flagged = target;
+                    }
+                }
+                self.envelopes_changed();
             }
         }
     }
@@ -1298,10 +1427,7 @@ impl EmailClientProvider {
             self.error_message = Some(format!("OAuth2 failed: {}", result.error));
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = oauth2::now_secs();
         self.config.oauth_access_token = result.access_token;
         self.config.oauth_refresh_token = result.refresh_token;
         self.config.token_expiry = now + result.expires_in;
@@ -1314,7 +1440,13 @@ impl EmailClientProvider {
         }
         // Always sync username from the token so the XOAUTH2 `user=` field
         // matches the authenticated account, even when a username was previously set.
-        if let Some(email) = oauth2::fetch_email(&self.config.oauth_access_token) {
+        // The sign-in task has asked already; the native flow asks here.
+        let email = if result.email.is_empty() {
+            oauth2::fetch_email(&self.config.oauth_access_token)
+        } else {
+            Some(result.email)
+        };
+        if let Some(email) = email {
             self.config.username = email;
         }
         self.save_server_config();
@@ -1381,10 +1513,8 @@ impl EmailClientProvider {
                                     self.special_folders.sent = Some(info.name.clone());
                                 }
                             }
-                            "\\Drafts" => {
-                                if self.special_folders.drafts.is_none() {
-                                    self.special_folders.drafts = Some(info.name.clone());
-                                }
+                            "\\Drafts" if self.special_folders.drafts.is_none() => {
+                                self.special_folders.drafts = Some(info.name.clone());
                             }
                             _ => {}
                         }
@@ -1418,39 +1548,10 @@ impl EmailClientProvider {
         items
     }
 
-    /// Fetch the folder list and prefetch INBOX at the same time.
-    ///
-    /// Two separate `RealImap` values on purpose: IMAP `SELECT` is
-    /// connection-global, so listing folders and listing INBOX messages over one
-    /// session would race on which mailbox is selected. The win here is a single
-    /// runtime and genuine concurrency, not connection reuse.
+    /// Fetch the folder list, with INBOX's latest messages alongside it.
     fn spawn_root_fetch(&mut self) {
         self.folder_fetch_inflight.store(true, Ordering::Release);
-        let inflight = Arc::clone(&self.folder_fetch_inflight);
-        let folder_slot = Arc::clone(&self.folder_fetch_result);
-        let inbox_slot = Arc::clone(&self.inbox_prefetch_result);
-        let bg_done = Arc::clone(&self.bg_completed);
-        let config = self.config.clone();
-
-        crate::connection::runtime().spawn(async move {
-            let mut folder_imap = crate::net::RealImap::from_config(&config);
-            let mut inbox_imap = crate::net::RealImap::from_config(&config);
-
-            // `join!` rather than `try_join!`: a failed folder list must not
-            // discard a good INBOX prefetch, and each slot carries its own
-            // `Result` for the drain logic to report.
-            let (folders, inbox) = tokio::join!(
-                folder_imap.list_folders(),
-                inbox_imap.list_messages("INBOX", 50),
-            );
-
-            *folder_slot.lock().unwrap() = Some(folders);
-            *inbox_slot.lock().unwrap() = Some(inbox);
-            // Clear inflight before raising the refresh flag, so the render
-            // thread cannot observe "done but still in flight".
-            inflight.store(false, Ordering::Release);
-            bg_done.store(true, Ordering::Release);
-        });
+        self.send_to_worker(worker::Job::Root);
     }
 
     fn build_root(&mut self) -> Vec<FfonElement> {
@@ -1507,7 +1608,7 @@ impl EmailClientProvider {
             }
         };
 
-        let folder_result = block_on(imap.list_folders());
+        let folder_result = imap.list_folders();
         self.build_root_from_folder_list(folder_result)
     }
 
@@ -1577,25 +1678,14 @@ impl EmailClientProvider {
                     return items;
                 }
             };
-            block_on(imap.list_messages(&real_folder, limit))
+            imap.list_messages(&real_folder, limit)
         };
 
         match folder_result {
             Err(e) => items.push(FfonElement::new_str(format!("IMAP error: {e}"))),
             Ok(headers) => {
-                let at_limit = headers.len() >= limit;
-                self.message_cache = headers.clone();
-                for h in &headers {
-                    items.push(FfonElement::new_obj(message_label(h)));
-                }
-                if items.is_empty() {
-                    items.push(FfonElement::new_str("(no messages)".to_owned()));
-                }
-                if at_limit {
-                    items.push(FfonElement::new_str(
-                        "<button>load-more</button>Load more…".to_owned(),
-                    ));
-                }
+                items = envelope_items(&headers, limit);
+                self.message_cache = headers;
             }
         }
 
@@ -1629,17 +1719,17 @@ impl EmailClientProvider {
                 if self.thread_fetch_key.as_deref() != Some(real_folder.as_str()) {
                     self.spawn_thread_fetch(&real_folder);
                 }
-            } else if let Some(imap) = self.imap.as_mut() {
-                if let Ok(Some(threads)) = block_on(imap.fetch_threads(&real_folder)) {
-                    let mut uid_to_thread: std::collections::HashMap<u32, Vec<u32>> =
-                        std::collections::HashMap::new();
-                    for thread in threads {
-                        for &uid in &thread {
-                            uid_to_thread.insert(uid, thread.clone());
-                        }
+            } else if let Some(imap) = self.imap.as_mut()
+                && let Ok(Some(threads)) = imap.fetch_threads(&real_folder)
+            {
+                let mut uid_to_thread: std::collections::HashMap<u32, Vec<u32>> =
+                    std::collections::HashMap::new();
+                for thread in threads {
+                    for &uid in &thread {
+                        uid_to_thread.insert(uid, thread.clone());
                     }
-                    self.thread_cache.insert(real_folder.clone(), uid_to_thread);
                 }
+                self.thread_cache.insert(real_folder.clone(), uid_to_thread);
             }
         }
 
@@ -1673,35 +1763,35 @@ impl EmailClientProvider {
 
         // Auto-mark as read: set \Seen flag and update cache so the list
         // re-renders without the ● prefix on the next envelope fetch.
-        if let Some(h) = self.message_cache.iter().find(|h| h.uid == uid) {
-            if !h.seen {
-                if self.bg_enabled() {
-                    // Optimistic: the flag is a display detail, and the STORE is
-                    // reported through `bg_errors` if it fails. Blocking a
-                    // message open on it would be the exact stall this avoids.
-                    self.spawn_bg_op(BgOp::SetFlags {
-                        folder: real_folder.clone(),
-                        uid,
-                        add: vec!["\\Seen".to_owned()],
-                        remove: vec![],
-                    });
+        if let Some(h) = self.message_cache.iter().find(|h| h.uid == uid)
+            && !h.seen
+        {
+            if self.bg_enabled() {
+                // Optimistic: the flag is a display detail, and the STORE is
+                // reported through `bg_errors` if it fails. Blocking a
+                // message open on it would be the exact stall this avoids.
+                self.spawn_bg_op(BgOp::SetFlags {
+                    folder: real_folder.clone(),
+                    uid,
+                    add: vec!["\\Seen".to_owned()],
+                    remove: vec![],
+                });
+                if let Some(h) = self.message_cache.iter_mut().find(|h| h.uid == uid) {
+                    h.seen = true;
+                }
+                self.envelopes_changed();
+            } else {
+                let marked = if let Some(ref mut imap) = self.imap {
+                    (imap.set_flags(&real_folder, uid, &["\\Seen"], &[])).is_ok()
+                } else {
+                    false
+                };
+                if marked {
                     if let Some(h) = self.message_cache.iter_mut().find(|h| h.uid == uid) {
                         h.seen = true;
                     }
+                    // Invalidate envelope cache so the list re-renders without ●.
                     self.envelope_cache = None;
-                } else {
-                    let marked = if let Some(ref mut imap) = self.imap {
-                        block_on(imap.set_flags(&real_folder, uid, &["\\Seen"], &[])).is_ok()
-                    } else {
-                        false
-                    };
-                    if marked {
-                        if let Some(h) = self.message_cache.iter_mut().find(|h| h.uid == uid) {
-                            h.seen = true;
-                        }
-                        // Invalidate envelope cache so the list re-renders without ●.
-                        self.envelope_cache = None;
-                    }
                 }
             }
         }
@@ -1737,31 +1827,30 @@ impl EmailClientProvider {
         let folder = self.history_folder.clone();
 
         // Fast path: the IMAP THREAD map, when we have one.
-        if let Some(uid) = self.history_uid {
-            if let Some(uid_map) = self.thread_cache.get(&folder) {
-                if let Some(thread_uids) = uid_map.get(&uid).cloned() {
-                    let other_uids: Vec<u32> = thread_uids
-                        .iter()
-                        .copied()
-                        .filter(|&u| u != uid)
-                        .take(10)
-                        .collect();
-                    if !other_uids.is_empty() {
-                        let items = other_uids
-                            .into_iter()
-                            .map(|other_uid| {
-                                match self.message_cache.iter().find(|h| h.uid == other_uid) {
-                                    Some(h) => HistoryItem::Label(format!(
-                                        "From: {} — Subject: {}",
-                                        h.from, h.subject
-                                    )),
-                                    None => HistoryItem::FetchUid(other_uid),
-                                }
-                            })
-                            .collect();
-                        return (items, vec![folder]);
-                    }
-                }
+        if let Some(uid) = self.history_uid
+            && let Some(uid_map) = self.thread_cache.get(&folder)
+            && let Some(thread_uids) = uid_map.get(&uid).cloned()
+        {
+            let other_uids: Vec<u32> = thread_uids
+                .iter()
+                .copied()
+                .filter(|&u| u != uid)
+                .take(10)
+                .collect();
+            if !other_uids.is_empty() {
+                let items = other_uids
+                    .into_iter()
+                    .map(
+                        |other_uid| match self.message_cache.iter().find(|h| h.uid == other_uid) {
+                            Some(h) => HistoryItem::Label(format!(
+                                "From: {} — Subject: {}",
+                                h.from, h.subject
+                            )),
+                            None => HistoryItem::FetchUid(other_uid),
+                        },
+                    )
+                    .collect();
+                return (items, vec![folder]);
             }
         }
 
@@ -1807,41 +1896,8 @@ impl EmailClientProvider {
     /// Resolve the History view's outstanding fetches in the background.
     fn spawn_history_fetch(&mut self, key: String) {
         let (plan, folders) = self.history_plan();
-        let imap = self.bg_imap();
-        let slot = Arc::clone(&self.history_fetch_result);
-        let bg_done = Arc::clone(&self.bg_completed);
-
         self.history_fetch_key = Some(key.clone());
-
-        crate::connection::runtime().spawn(async move {
-            let mut labels = Vec::new();
-            let mut guard = imap.lock().await;
-            for item in plan {
-                match item {
-                    HistoryItem::Label(l) => labels.push(l),
-                    HistoryItem::FetchUid(uid) => {
-                        let folder = folders.first().cloned().unwrap_or_default();
-                        if let Ok(Some(msg)) = guard.fetch_message(&folder, uid).await {
-                            labels.push(format!("From: {} — Subject: {}", msg.from, msg.subject));
-                        }
-                    }
-                    HistoryItem::FetchMessageId(msg_id) => {
-                        for folder in &folders {
-                            if let Ok(Some(msg)) =
-                                guard.fetch_message_by_message_id(folder, &msg_id).await
-                            {
-                                labels
-                                    .push(format!("From: {} — Subject: {}", msg.from, msg.subject));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            drop(guard);
-            *slot.lock().unwrap() = Some((key, labels));
-            bg_done.store(true, Ordering::Release);
-        });
+        self.send_to_worker(worker::Job::History { key, plan, folders });
     }
 
     fn build_history(&mut self) -> Vec<FfonElement> {
@@ -1851,20 +1907,20 @@ impl EmailClientProvider {
             // Fold in a completed resolve; a result for a different message is
             // dropped, since the user has navigated on.
             let done = self.history_fetch_result.lock().unwrap().take();
-            if let Some((done_key, labels)) = done {
-                if done_key == key {
-                    self.history_fetch_key = None;
-                    self.history_labels = Some((key.clone(), labels));
-                }
+            if let Some((done_key, labels)) = done
+                && done_key == key
+            {
+                self.history_fetch_key = None;
+                self.history_labels = Some((key.clone(), labels));
             }
 
-            if let Some((cached_key, labels)) = &self.history_labels {
-                if *cached_key == key {
-                    if labels.is_empty() {
-                        return vec![FfonElement::new_str("(no history)".to_owned())];
-                    }
-                    return labels.iter().cloned().map(FfonElement::new_obj).collect();
+            if let Some((cached_key, labels)) = &self.history_labels
+                && *cached_key == key
+            {
+                if labels.is_empty() {
+                    return vec![FfonElement::new_str("(no history)".to_owned())];
                 }
+                return labels.iter().cloned().map(FfonElement::new_obj).collect();
             }
 
             // Nothing to do at all — answer without a round-trip.
@@ -1893,44 +1949,41 @@ impl EmailClientProvider {
 
         // Fast path: use the IMAP THREAD cache (single THREAD command replaces
         // N per-Message-ID SEARCH commands).
-        if let Some(uid) = self.history_uid {
-            if let Some(uid_map) = self.thread_cache.get(&folder) {
-                if let Some(thread_uids) = uid_map.get(&uid).cloned() {
-                    let other_uids: Vec<u32> = thread_uids
+        if let Some(uid) = self.history_uid
+            && let Some(uid_map) = self.thread_cache.get(&folder)
+            && let Some(thread_uids) = uid_map.get(&uid).cloned()
+        {
+            let other_uids: Vec<u32> = thread_uids
+                .iter()
+                .copied()
+                .filter(|&u| u != uid)
+                .take(10)
+                .collect();
+            if !other_uids.is_empty() {
+                let mut items = vec![];
+                for other_uid in other_uids {
+                    // Check message_cache first (already fetched for this folder).
+                    let label = self
+                        .message_cache
                         .iter()
-                        .copied()
-                        .filter(|&u| u != uid)
-                        .take(10)
-                        .collect();
-                    if !other_uids.is_empty() {
-                        let mut items = vec![];
-                        for other_uid in other_uids {
-                            // Check message_cache first (already fetched for this folder).
-                            let label = self
-                                .message_cache
-                                .iter()
-                                .find(|h| h.uid == other_uid)
-                                .map(|h| format!("From: {} — Subject: {}", h.from, h.subject));
-                            if let Some(lbl) = label {
-                                items.push(FfonElement::new_obj(lbl));
-                            } else if let Some(ref mut imap) = self.imap {
-                                // Not in the current-folder cache — fetch by UID.
-                                let uid_str = other_uid.to_string();
-                                if let Ok(Some(msg)) =
-                                    block_on(imap.fetch_message(&folder, other_uid))
-                                {
-                                    let _ = uid_str;
-                                    items.push(FfonElement::new_obj(format!(
-                                        "From: {} — Subject: {}",
-                                        msg.from, msg.subject
-                                    )));
-                                }
-                            }
-                        }
-                        if !items.is_empty() {
-                            return items;
+                        .find(|h| h.uid == other_uid)
+                        .map(|h| format!("From: {} — Subject: {}", h.from, h.subject));
+                    if let Some(lbl) = label {
+                        items.push(FfonElement::new_obj(lbl));
+                    } else if let Some(ref mut imap) = self.imap {
+                        // Not in the current-folder cache — fetch by UID.
+                        let uid_str = other_uid.to_string();
+                        if let Ok(Some(msg)) = imap.fetch_message(&folder, other_uid) {
+                            let _ = uid_str;
+                            items.push(FfonElement::new_obj(format!(
+                                "From: {} — Subject: {}",
+                                msg.from, msg.subject
+                            )));
                         }
                     }
+                }
+                if !items.is_empty() {
+                    return items;
                 }
             }
         }
@@ -1972,15 +2025,13 @@ impl EmailClientProvider {
             p = &p[end + 1..];
 
             'search: for search_folder in &search_folders {
-                if let Some(ref mut imap) = self.imap {
-                    if let Ok(Some(msg)) =
-                        block_on(imap.fetch_message_by_message_id(search_folder, msg_id))
-                    {
-                        let key = format!("From: {} — Subject: {}", msg.from, msg.subject);
-                        items.push(FfonElement::new_obj(key));
-                        count += 1;
-                        break 'search;
-                    }
+                if let Some(ref mut imap) = self.imap
+                    && let Ok(Some(msg)) = imap.fetch_message_by_message_id(search_folder, msg_id)
+                {
+                    let key = format!("From: {} — Subject: {}", msg.from, msg.subject);
+                    items.push(FfonElement::new_obj(key));
+                    count += 1;
+                    break 'search;
                 }
             }
         }
@@ -2022,10 +2073,10 @@ impl EmailClientProvider {
                     }
                 }
             } else {
-                if let Some(ref mut imap) = self.imap {
-                    if let Ok(Some(msg)) = block_on(imap.fetch_message(&folder, uid)) {
-                        prefill_compose(&mut self.compose, &msg, mode, &username);
-                    }
+                if let Some(ref mut imap) = self.imap
+                    && let Ok(Some(msg)) = imap.fetch_message(&folder, uid)
+                {
+                    prefill_compose(&mut self.compose, &msg, mode, &username);
                 }
                 self.compose.prefilled = true;
             }
@@ -2144,7 +2195,7 @@ impl EmailClientProvider {
             .map(|(n, b)| (n.as_str(), b.as_slice()))
             .collect();
 
-        let raw = block_on(smtp.send(
+        let raw = (smtp.send(
             &from,
             &to_r,
             &cc_r,
@@ -2156,16 +2207,14 @@ impl EmailClientProvider {
 
         // APPEND to Sent folder (skip for Gmail — its SMTP server auto-saves).
         let skip_append = self.config.smtp_url.contains("smtp.gmail.com");
-        if !skip_append {
-            if let Some(sent) = self.special_folders.sent.clone() {
-                if self.bg_enabled() {
-                    self.spawn_bg_op(BgOp::Append {
-                        folder: sent,
-                        message: raw.clone(),
-                    });
-                } else if let Some(ref mut imap) = self.imap {
-                    let _ = block_on(imap.append(&sent, &raw));
-                }
+        if !skip_append && let Some(sent) = self.special_folders.sent.clone() {
+            if self.bg_enabled() {
+                self.spawn_bg_op(BgOp::Append {
+                    folder: sent,
+                    message: raw.clone(),
+                });
+            } else if let Some(ref mut imap) = self.imap {
+                let _ = imap.append(&sent, &raw);
             }
         }
         Ok(())
@@ -2202,35 +2251,19 @@ impl EmailClientProvider {
             })
             .collect();
 
-        let slot = Arc::clone(&self.send_result);
-        let inflight = Arc::clone(&self.send_inflight);
-        let bg_done = Arc::clone(&self.bg_completed);
-        inflight.store(true, Ordering::Release);
+        self.send_inflight.store(true, Ordering::Release);
         self.pending_send_draft = Some(draft);
-
-        crate::connection::runtime().spawn(async move {
-            let mut smtp = crate::net::RealSmtp::from_config(&config);
-            let to_r: Vec<&str> = to_v.iter().map(String::as_str).collect();
-            let cc_r: Vec<&str> = cc_v.iter().map(String::as_str).collect();
-            let bcc_r: Vec<&str> = bcc_v.iter().map(String::as_str).collect();
-            let attachment_refs: Vec<(&str, &[u8])> = attachment_data
-                .iter()
-                .map(|(n, b)| (n.as_str(), b.as_slice()))
-                .collect();
-            let result = smtp
-                .send(
-                    &from,
-                    &to_r,
-                    &cc_r,
-                    &bcc_r,
-                    &subject,
-                    &body,
-                    &attachment_refs,
-                )
-                .await;
-            *slot.lock().unwrap() = Some(result);
-            inflight.store(false, Ordering::Release);
-            bg_done.store(true, Ordering::Release);
+        // The token may just have been refreshed: the worker sends with the
+        // settings it is handed here.
+        self.send_to_worker(worker::Job::Configure(config));
+        self.send_to_worker(worker::Job::Send {
+            from,
+            to: to_v,
+            cc: cc_v,
+            bcc: bcc_v,
+            subject,
+            body,
+            attachments: attachment_data,
         });
         true
     }
@@ -2245,13 +2278,13 @@ impl EmailClientProvider {
                 self.pending_send_draft = None;
                 self.outbox_pending = false;
                 // APPEND to Sent (skip for Gmail — its SMTP server auto-saves).
-                if !self.config.smtp_url.contains("smtp.gmail.com") {
-                    if let Some(sent) = self.special_folders.sent.clone() {
-                        self.spawn_bg_op(BgOp::Append {
-                            folder: sent,
-                            message: raw,
-                        });
-                    }
+                if !self.config.smtp_url.contains("smtp.gmail.com")
+                    && let Some(sent) = self.special_folders.sent.clone()
+                {
+                    self.spawn_bg_op(BgOp::Append {
+                        folder: sent,
+                        message: raw,
+                    });
                 }
             }
             Err(e) => {
@@ -2362,32 +2395,12 @@ impl EmailClientProvider {
             return false;
         }
 
-        // Spawn a background refresh.
+        // Hand the refresh to the worker.
         self.token_refresh_inflight.store(true, Ordering::Release);
-        let inflight = Arc::clone(&self.token_refresh_inflight);
-        let result_slot = Arc::clone(&self.token_refresh_result);
-        let bg_done = Arc::clone(&self.bg_completed);
-        let client_id = self.config.client_id.clone();
-        let client_secret = self.config.client_secret.clone();
-        let refresh_token_str = self.config.oauth_refresh_token.clone();
-        // `oauth2::refresh_token` uses blocking reqwest and is not IMAP, so it
-        // goes on the runtime's blocking pool rather than being rewritten async.
-        // That removes the last raw thread with no behaviour change.
-        crate::connection::runtime().spawn_blocking(move || {
-            let r = oauth2::refresh_token(&client_id, &client_secret, &refresh_token_str);
-            let outcome = if r.success {
-                let expiry = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
-                    + r.expires_in;
-                Ok((r.access_token, expiry))
-            } else {
-                Err("OAuth token refresh failed".to_owned())
-            };
-            *result_slot.lock().unwrap() = Some(outcome);
-            inflight.store(false, Ordering::Release);
-            bg_done.store(true, Ordering::Release);
+        self.send_to_worker(worker::Job::RefreshToken {
+            client_id: self.config.client_id.clone(),
+            client_secret: self.config.client_secret.clone(),
+            refresh_token: self.config.oauth_refresh_token.clone(),
         });
         false
     }
@@ -2449,10 +2462,10 @@ fn build_draft_bytes(draft: &Draft, from: &str) -> Vec<u8> {
 /// `"Alice <alice@example.com>"` → `"alice@example.com"`.
 /// Plain `"alice@example.com"` → `"alice@example.com"`.
 fn extract_email_addr(s: &str) -> &str {
-    if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>')) {
-        if lt < gt {
-            return s[lt + 1..gt].trim();
-        }
+    if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>'))
+        && lt < gt
+    {
+        return s[lt + 1..gt].trim();
     }
     s.trim()
 }
@@ -2615,6 +2628,7 @@ fn build_message_view(msg: &EmailMessage) -> Vec<FfonElement> {
 ///
 /// - Text: one `<input>` leaf with the current content (empty → no children).
 /// - Ffon: the stored elements directly (each leaf should already carry `<input>` tags).
+///
 /// Reconstruct a `MailBody` from FFON body children (inverse of `body_to_compose_children`).
 ///
 /// Called by `sync_ffon_body_children` to keep `compose.draft.body` in sync after
@@ -2624,12 +2638,11 @@ fn body_from_ffon_children(children: &[FfonElement]) -> MailBody {
         return MailBody::Text(String::new());
     }
     // A single plain Str with an <input> tag is the Text representation.
-    if children.len() == 1 {
-        if let FfonElement::Str(s) = &children[0] {
-            if let Some(content) = sicompass_sdk::tags::extract_input(s) {
-                return MailBody::Text(content);
-            }
-        }
+    if children.len() == 1
+        && let FfonElement::Str(s) = &children[0]
+        && let Some(content) = sicompass_sdk::tags::extract_input(s)
+    {
+        return MailBody::Text(content);
     }
     MailBody::Ffon(children.to_vec())
 }
@@ -2886,14 +2899,12 @@ fn normalize_body_for_send(body: &MailBody) -> MailBody {
         }
         MailBody::Text(s) => {
             // Try FFON detection.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                if sicompass_sdk::ffon::is_ffon(&v) {
-                    if let Ok(elems) =
-                        serde_json::from_value::<Vec<sicompass_sdk::ffon::FfonElement>>(v)
-                    {
-                        return MailBody::Ffon(elems);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                && sicompass_sdk::ffon::is_ffon(&v)
+                && let Ok(elems) =
+                    serde_json::from_value::<Vec<sicompass_sdk::ffon::FfonElement>>(v)
+            {
+                return MailBody::Ffon(elems);
             }
             body.clone()
         }
@@ -2917,15 +2928,13 @@ fn body_format_label(body: &MailBody) -> &'static str {
 /// is emptied by deleting all children.
 fn renormalize_body_variant(body: &mut MailBody) {
     use sicompass_sdk::tags;
-    if let MailBody::Ffon(elems) = body {
-        if elems.len() == 1 {
-            if let FfonElement::Str(raw) = &elems[0] {
-                if raw != I_PLACEHOLDER {
-                    let plain = tags::extract_input(raw).unwrap_or_else(|| raw.clone());
-                    *body = MailBody::Text(plain);
-                }
-            }
-        }
+    if let MailBody::Ffon(elems) = body
+        && elems.len() == 1
+        && let FfonElement::Str(raw) = &elems[0]
+        && raw != I_PLACEHOLDER
+    {
+        let plain = tags::extract_input(raw).unwrap_or_else(|| raw.clone());
+        *body = MailBody::Text(plain);
     }
 }
 
@@ -2937,12 +2946,11 @@ fn detect_body_format_live(body: MailBody) -> MailBody {
     match body {
         MailBody::Text(ref s) => {
             // Try FFON: only promote when the text is valid JSON FFON.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                if sicompass_sdk::ffon::is_ffon(&v) {
-                    if let Ok(elems) = serde_json::from_value::<Vec<FfonElement>>(v) {
-                        return MailBody::Ffon(elems);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                && sicompass_sdk::ffon::is_ffon(&v)
+                && let Ok(elems) = serde_json::from_value::<Vec<FfonElement>>(v)
+            {
+                return MailBody::Ffon(elems);
             }
             body
         }
@@ -2960,53 +2968,77 @@ impl Default for EmailClientProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl Provider for EmailClientProvider {
-    fn name(&self) -> &str {
+// The provider's side of each host call, in the shapes the tests use. The
+// `Plugin` impl below adapts them to the plugin interface.
+impl EmailClientProvider {
+    pub fn name(&self) -> &str {
         "emailclient"
     }
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("emailclient-display-name")
     }
 
-    fn no_cache(&self) -> bool {
+    pub fn no_cache(&self) -> bool {
         true
     }
 
-    fn needs_refresh(&self) -> bool {
+    pub fn needs_refresh(&self) -> bool {
         self.needs_refresh_flag.load(Ordering::Relaxed)
     }
 
-    fn clear_needs_refresh(&mut self) {
+    pub fn clear_needs_refresh(&mut self) {
         self.needs_refresh_flag.store(false, Ordering::Relaxed);
         // Invalidate envelope cache so next fetch re-queries.
         self.envelope_cache = None;
     }
 
-    fn init(&mut self) {
+    pub fn init(&mut self) {
         self.current_path = "/".to_owned();
         self.folder_cache = None;
         self.envelope_cache = None;
         self.envelope_cache_folder.clear();
 
-        // Load config from ~/.config/sicompass/settings.json.
+        // The settings `plugin.json` declares, from the host.
+        #[cfg(target_arch = "wasm32")]
+        for key in [
+            "emailImapUrl",
+            "emailSmtpUrl",
+            "emailUsername",
+            "emailPassword",
+            "emailClientId",
+            "emailClientSecret",
+        ] {
+            if let Some(v) = sicompass_pdk::host::get_setting(key)
+                && !v.is_empty()
+            {
+                self.apply_setting(key, &v);
+            }
+        }
+
+        // Then what a sign-in saved in the plugin's own file (the tokens, and
+        // the servers and address it filled in), which takes over.
         let Some(path) = self.config_path() else {
+            self.rebuild_backends();
             return;
         };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else {
-            return;
-        };
-        let Some(section) = root.get("email client").and_then(|v| v.as_object()) else {
+        let section = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|root| {
+                root.get("email client")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+            });
+        let Some(section) = section else {
+            self.rebuild_backends();
             return;
         };
 
         macro_rules! load_str {
             ($key:literal, $field:expr_2021) => {
-                if let Some(v) = section.get($key).and_then(|v| v.as_str()) {
+                if let Some(v) = section.get($key).and_then(|v| v.as_str())
+                    && !v.is_empty()
+                {
                     $field = v.to_owned();
                 }
             };
@@ -3027,13 +3059,14 @@ impl Provider for EmailClientProvider {
         self.rebuild_backends();
     }
 
-    fn cleanup(&mut self) {
+    pub fn cleanup(&mut self) {
         self.idle.stop();
         self.folder_cache = None;
         self.envelope_cache = None;
     }
 
-    fn fetch(&mut self) -> Vec<FfonElement> {
+    pub fn fetch(&mut self) -> Vec<FfonElement> {
+        self.drain_worker();
         if !self.ensure_fresh_token_async() {
             return vec![FfonElement::new_str("Loading…".to_owned())];
         }
@@ -3048,7 +3081,7 @@ impl Provider for EmailClientProvider {
         let in_compose = segs
             .iter()
             .any(|s| matches!(s.as_str(), "compose" | "reply" | "reply all" | "forward"));
-        if in_compose && segs.last().map_or(false, |s| s.starts_with("Body:")) {
+        if in_compose && segs.last().is_some_and(|s| s.starts_with("Body:")) {
             return body_to_compose_children(&self.compose.draft.body);
         }
 
@@ -3089,7 +3122,7 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn push_path(&mut self, segment: &str) {
+    pub fn push_path(&mut self, segment: &str) {
         let segs_len = self.path_segments().len();
 
         // Handle compose/reply actions entered from a message view.
@@ -3136,21 +3169,21 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn pop_path(&mut self) {
+    pub fn pop_path(&mut self) {
         // Save draft and reset compose state when navigating away.
         if self.at_compose() {
             self.compose_sent = false;
-            if Self::is_draft_non_empty(&self.compose.draft) {
-                if let Some(drafts_folder) = self.special_folders.drafts.clone() {
-                    let bytes = build_draft_bytes(&self.compose.draft, &self.config.username);
-                    if self.bg_enabled() {
-                        self.spawn_bg_op(BgOp::Append {
-                            folder: drafts_folder,
-                            message: bytes,
-                        });
-                    } else if let Some(ref mut imap) = self.imap {
-                        let _ = block_on(imap.append(&drafts_folder, &bytes));
-                    }
+            if Self::is_draft_non_empty(&self.compose.draft)
+                && let Some(drafts_folder) = self.special_folders.drafts.clone()
+            {
+                let bytes = build_draft_bytes(&self.compose.draft, &self.config.username);
+                if self.bg_enabled() {
+                    self.spawn_bg_op(BgOp::Append {
+                        folder: drafts_folder,
+                        message: bytes,
+                    });
+                } else if let Some(ref mut imap) = self.imap {
+                    let _ = imap.append(&drafts_folder, &bytes);
                 }
             }
         }
@@ -3163,15 +3196,15 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn current_path(&self) -> &str {
+    pub fn current_path(&self) -> &str {
         &self.current_path
     }
 
-    fn set_current_path(&mut self, path: &str) {
+    pub fn set_current_path(&mut self, path: &str) {
         self.current_path = path.to_owned();
     }
 
-    fn commit_edit(&mut self, old_content: &str, new_content: &str) -> bool {
+    pub fn commit_edit(&mut self, old_content: &str, new_content: &str) -> bool {
         // Collect path segments as owned strings so we can freely mutate `self` later.
         let segs: Vec<String> = self
             .current_path
@@ -3214,7 +3247,7 @@ impl Provider for EmailClientProvider {
                     return false;
                 };
                 // Sub-path: segments after `Body:` (empty → top-level body edit).
-                let sub_segs: Vec<String> = segs[body_pos + 1..].iter().cloned().collect();
+                let sub_segs: Vec<String> = segs[body_pos + 1..].to_vec();
 
                 if sub_segs.is_empty() {
                     // Top-level body edit — same as before.
@@ -3232,10 +3265,10 @@ impl Provider for EmailClientProvider {
                     // the body is already Ffon (you can only navigate into nested Objs when
                     // the body is Ffon), and the path label doesn't change.
                     let sub_segs_ref: Vec<&str> = sub_segs.iter().map(|s| s.as_str()).collect();
-                    if let MailBody::Ffon(ref mut elems) = self.compose.draft.body {
-                        if let Some(target) = body_elems_at_sub_path_mut(elems, &sub_segs_ref) {
-                            update_body_elems(target, old_content, new_content);
-                        }
+                    if let MailBody::Ffon(ref mut elems) = self.compose.draft.body
+                        && let Some(target) = body_elems_at_sub_path_mut(elems, &sub_segs_ref)
+                    {
+                        update_body_elems(target, old_content, new_content);
                     }
                 }
                 true
@@ -3243,7 +3276,7 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn on_button_press(&mut self, function_name: &str) {
+    pub fn on_button_press(&mut self, function_name: &str) {
         match function_name {
             "send" => {
                 if self.bg_enabled() {
@@ -3272,7 +3305,7 @@ impl Provider for EmailClientProvider {
                                     message: bytes,
                                 });
                             } else if let Some(ref mut imap) = self.imap {
-                                let _ = block_on(imap.append(&drafts_folder, &bytes));
+                                let _ = imap.append(&drafts_folder, &bytes);
                             }
                         }
                         self.outbox_pending = true;
@@ -3294,7 +3327,7 @@ impl Provider for EmailClientProvider {
                 // Increase the display limit for the current folder by 50.
                 let segs = self.path_segments();
                 if let Some(display) = segs.first().cloned() {
-                    let real = self.lookup_folder(&display).to_owned();
+                    let real = self.lookup_folder(display).to_owned();
                     let entry = self.folder_limits.entry(real).or_insert(50);
                     *entry += 50;
                     self.envelope_cache = None;
@@ -3304,7 +3337,8 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn tick(&mut self) -> bool {
+    pub fn tick(&mut self) -> bool {
+        self.drain_worker();
         // A background fetch or mutation finished: re-render, but leave the
         // caches alone — the result has already been folded in.
         let mut needs_refresh = self.bg_completed.swap(false, Ordering::AcqRel);
@@ -3325,14 +3359,12 @@ impl Provider for EmailClientProvider {
                 needs_refresh = true;
             }
         } else if self.outbox_pending {
-            match self.send_draft() {
-                Ok(()) => {
-                    self.outbox_pending = false;
-                    self.compose = ComposeState::default();
-                    self.compose_sent = true;
-                    needs_refresh = true;
-                }
-                Err(_) => {} // keep outbox_pending, retry next tick
+            // On failure outbox_pending stays, to retry next tick.
+            if self.send_draft().is_ok() {
+                self.outbox_pending = false;
+                self.compose = ComposeState::default();
+                self.compose_sent = true;
+                needs_refresh = true;
             }
         }
 
@@ -3353,10 +3385,7 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn collect_extended_search_items(
-        &self,
-    ) -> Option<Vec<sicompass_sdk::provider::SearchResultItem>> {
-        use sicompass_sdk::provider::SearchResultItem;
+    pub fn collect_extended_search_items(&self) -> Option<Vec<SearchResultItem>> {
         let mut results = Vec::new();
         for h in &self.message_cache {
             // Look up the folder display name via the reverse of folder_mappings.
@@ -3376,7 +3405,7 @@ impl Provider for EmailClientProvider {
         Some(results)
     }
 
-    fn take_error(&mut self) -> Option<String> {
+    pub fn take_error(&mut self) -> Option<String> {
         // An inline error wins; background failures queue behind it and are
         // surfaced one per call on subsequent frames.
         if let Some(e) = self.error_message.take() {
@@ -3390,29 +3419,23 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn take_timeline_entries(&mut self) -> Vec<TimelineEntry> {
+    pub fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
         std::mem::take(&mut self.pending_timeline_entries)
     }
 
-    async fn undo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        let op = match entry {
-            TimelineEntry::ImapOp { op, .. } => op,
-            _ => return,
-        };
-        self.apply_imap_op(op, true, error).await;
+    pub fn undo(&mut self, entry: &ProviderOp, error: &mut String) {
+        if let Some(op) = decode_op(entry) {
+            self.apply_imap_op(&op, true, error);
+        }
     }
 
-    async fn redo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        let op = match entry {
-            TimelineEntry::ImapOp { op, .. } => op,
-            _ => return,
-        };
-        self.apply_imap_op(op, false, error).await;
+    pub fn redo(&mut self, entry: &ProviderOp, error: &mut String) {
+        if let Some(op) = decode_op(entry) {
+            self.apply_imap_op(&op, false, error);
+        }
     }
 
-    fn fetch_subtree_parent_key(&mut self) -> Option<String> {
+    pub fn fetch_subtree_parent_key(&mut self) -> Option<String> {
         // Collect as owned strings to avoid borrow conflicts with self.compose.
         let segs: Vec<String> = self
             .current_path
@@ -3446,7 +3469,7 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
+    pub fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
         // When the current path is inside a compose context, return the body children
         // at the correct nesting depth instead of doing a full provider re-fetch.
         // Check for a compose-root token anywhere in the path so that reply/forward
@@ -3488,13 +3511,13 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
+    pub fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
         self.compose.draft.body = body_from_ffon_children(children);
         renormalize_body_variant(&mut self.compose.draft.body);
         self.sync_body_path_label();
     }
 
-    fn commands(&self) -> Vec<String> {
+    pub fn commands(&self) -> Vec<String> {
         if !self.is_logged_in() {
             return vec![];
         }
@@ -3503,12 +3526,19 @@ impl Provider for EmailClientProvider {
             "logout".to_owned(),
             "refresh".to_owned(),
         ];
-        // Message-operation commands are only meaningful when a specific message is
-        // selected (path has ≥ 2 segments: folder + message label) AND the UID
-        // is resolvable from the label in the cache.
+        // Message-operation commands are only meaningful on a message: inside
+        // one (path has ≥ 2 segments: folder + message label, the UID
+        // resolvable from the label in the cache), or on the message list of a
+        // folder that has messages, where `handle_command` resolves the one
+        // under the cursor from its row. Ctrl+D is only offered when "delete"
+        // is listed.
         let segs = self.path_segments();
         let at_message = segs.len() >= 2 && self.lookup_uid(segs[1]).is_some();
-        if at_message {
+        let on_message_list = segs.len() == 1
+            && !matches!(segs[0], "compose" | "reply" | "reply all" | "forward")
+            && self.envelope_cache_folder == self.lookup_folder(segs[0])
+            && !self.message_cache.is_empty();
+        if at_message || on_message_list {
             cmds.extend([
                 "mark-read".to_owned(),
                 "mark-unread".to_owned(),
@@ -3522,13 +3552,13 @@ impl Provider for EmailClientProvider {
         cmds
     }
 
-    fn command_list_items(&self, command: &str) -> Vec<sicompass_sdk::provider::ListItem> {
+    pub fn command_list_items(&self, command: &str) -> Vec<ListItem> {
         if command == "move" {
             let current_real = &self.pending_move_folder;
             self.folder_mappings
                 .iter()
                 .filter(|(_, real)| real != current_real)
-                .map(|(display, real)| sicompass_sdk::provider::ListItem {
+                .map(|(display, real)| ListItem {
                     label: display.clone(),
                     data: real.clone(),
                 })
@@ -3538,7 +3568,7 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn execute_command(&mut self, command: &str, selection: &str) -> bool {
+    pub fn execute_command(&mut self, command: &str, selection: &str) -> bool {
         if command != "move" {
             return false;
         }
@@ -3573,14 +3603,14 @@ impl Provider for EmailClientProvider {
                 uid,
                 dest: dest.to_owned(),
             });
-        } else if let Some(ref mut imap) = self.imap {
-            if let Err(e) = block_on(imap.move_message(&from, uid, &dest)) {
-                self.error_message = Some(format!("move failed: {e}"));
-                return false;
-            }
+        } else if let Some(ref mut imap) = self.imap
+            && let Err(e) = imap.move_message(&from, uid, &dest)
+        {
+            self.error_message = Some(format!("move failed: {e}"));
+            return false;
         }
-        self.envelope_cache = None;
         self.message_cache.retain(|h| h.uid != uid);
+        self.envelopes_changed();
         if !msg_id.is_empty() {
             self.push_imap_op(ImapOpKind::Move {
                 msg_id: msg_id.clone(),
@@ -3591,14 +3621,13 @@ impl Provider for EmailClientProvider {
         true
     }
 
-    fn handle_command(
+    pub fn handle_command(
         &mut self,
         cmd: &str,
         elem_key: &str,
         _elem_type: i32,
         error: &mut String,
     ) -> Option<FfonElement> {
-        register_translations();
         match cmd {
             "compose" => {
                 self.compose = ComposeState::default();
@@ -3666,14 +3695,14 @@ impl Provider for EmailClientProvider {
                             add: add.iter().map(|s| (*s).to_owned()).collect(),
                             remove: remove.iter().map(|s| (*s).to_owned()).collect(),
                         });
-                    } else if let Some(ref mut imap) = self.imap {
-                        if let Err(e) = block_on(imap.set_flags(&real_folder, uid, add, remove)) {
-                            let mut args = localize::Args::new();
-                            args.set("cmd", cmd.to_owned());
-                            args.set("err", e.to_string());
-                            *error = localize::t_args("emailclient-error-command-failed", &args);
-                            return None;
-                        }
+                    } else if let Some(ref mut imap) = self.imap
+                        && let Err(e) = imap.set_flags(&real_folder, uid, add, remove)
+                    {
+                        let mut args = localize::Args::new();
+                        args.set("cmd", cmd.to_owned());
+                        args.set("err", e.to_string());
+                        *error = localize::t_args("emailclient-error-command-failed", &args);
+                        return None;
                     }
                     // Update cached header so the list re-renders correctly.
                     if let Some(h) = self.message_cache.iter_mut().find(|h| h.uid == uid) {
@@ -3684,7 +3713,7 @@ impl Provider for EmailClientProvider {
                             _ => h.flagged = false,
                         }
                     }
-                    self.envelope_cache = None;
+                    self.envelopes_changed();
                     match cmd {
                         "mark-read" => self.push_imap_op(ImapOpKind::SetSeen {
                             msg_uid: uid,
@@ -3742,14 +3771,13 @@ impl Provider for EmailClientProvider {
                                     uid,
                                     dest: t.clone(),
                                 });
-                            } else if let Some(ref mut imap) = self.imap {
-                                if let Err(e) = block_on(imap.move_message(&real_folder, uid, t)) {
-                                    let mut args = localize::Args::new();
-                                    args.set("err", e.to_string());
-                                    *error =
-                                        localize::t_args("emailclient-error-delete-failed", &args);
-                                    return None;
-                                }
+                            } else if let Some(ref mut imap) = self.imap
+                                && let Err(e) = imap.move_message(&real_folder, uid, t)
+                            {
+                                let mut args = localize::Args::new();
+                                args.set("err", e.to_string());
+                                *error = localize::t_args("emailclient-error-delete-failed", &args);
+                                return None;
                             }
                             if !msg_id.is_empty() {
                                 self.push_imap_op(ImapOpKind::Trash {
@@ -3780,13 +3808,12 @@ impl Provider for EmailClientProvider {
                                 uid,
                             });
                         } else if let Some(ref mut imap) = self.imap {
-                            let _ =
-                                block_on(imap.set_flags(&real_folder, uid, &["\\Deleted"], &[]));
-                            let _ = block_on(imap.expunge_uid(&real_folder, uid));
+                            let _ = imap.set_flags(&real_folder, uid, &["\\Deleted"], &[]);
+                            let _ = imap.expunge_uid(&real_folder, uid);
                         }
                     }
-                    self.envelope_cache = None;
                     self.message_cache.retain(|h| h.uid != uid);
+                    self.envelopes_changed();
                 } else {
                     *error = localize::t("emailclient-error-delete-not-viewing");
                 }
@@ -3819,18 +3846,17 @@ impl Provider for EmailClientProvider {
                                     uid,
                                     dest: dest.clone(),
                                 });
-                            } else if let Some(ref mut imap) = self.imap {
-                                if let Err(e) = block_on(imap.move_message(&real_folder, uid, dest))
-                                {
-                                    let mut args = localize::Args::new();
-                                    args.set("err", e.to_string());
-                                    *error =
-                                        localize::t_args("emailclient-error-archive-failed", &args);
-                                    return None;
-                                }
+                            } else if let Some(ref mut imap) = self.imap
+                                && let Err(e) = imap.move_message(&real_folder, uid, dest)
+                            {
+                                let mut args = localize::Args::new();
+                                args.set("err", e.to_string());
+                                *error =
+                                    localize::t_args("emailclient-error-archive-failed", &args);
+                                return None;
                             }
-                            self.envelope_cache = None;
                             self.message_cache.retain(|h| h.uid != uid);
+                            self.envelopes_changed();
                             if !msg_id.is_empty() {
                                 self.push_imap_op(ImapOpKind::Archive {
                                     msg_id: msg_id.clone(),
@@ -3864,7 +3890,18 @@ impl Provider for EmailClientProvider {
         }
     }
 
-    fn on_setting_change(&mut self, key: &str, value: &str) {
+    pub fn on_setting_change(&mut self, key: &str, value: &str) {
+        if self.apply_setting(key, value) {
+            // Rebuild backends so they pick up the new config.
+            self.imap = None;
+            self.smtp = None;
+            self.reset_bg_imap();
+            self.rebuild_backends();
+        }
+    }
+
+    /// Take one setting's value. `false` when the key is not one of ours.
+    fn apply_setting(&mut self, key: &str, value: &str) -> bool {
         let mut changed = true;
         match key {
             "emailImapUrl" => self.config.imap_url = value.to_owned(),
@@ -3884,13 +3921,7 @@ impl Provider for EmailClientProvider {
                 changed = false;
             }
         }
-        if changed {
-            // Rebuild backends so they pick up the new config.
-            self.imap = None;
-            self.smtp = None;
-            self.reset_bg_imap();
-            self.rebuild_backends();
-        }
+        changed
     }
 }
 
@@ -3992,16 +4023,15 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl ImapBackend for MockImap {
-        async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
+        fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
             self.list_folders_calls += 1;
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             Ok(self.folders.clone())
         }
-        async fn list_messages(
+        fn list_messages(
             &mut self,
             _folder: &str,
             _limit: usize,
@@ -4012,7 +4042,7 @@ mod tests {
             }
             Ok(self.messages.clone())
         }
-        async fn fetch_message(
+        fn fetch_message(
             &mut self,
             _folder: &str,
             _uid: u32,
@@ -4022,7 +4052,7 @@ mod tests {
             }
             Ok(self.detail.clone())
         }
-        async fn fetch_message_by_message_id(
+        fn fetch_message_by_message_id(
             &mut self,
             folder: &str,
             _msg_id: &str,
@@ -4031,14 +4061,14 @@ mod tests {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
-            if let Some(ref req) = self.by_msg_id_folder {
-                if folder != req {
-                    return Ok(None);
-                }
+            if let Some(ref req) = self.by_msg_id_folder
+                && folder != req
+            {
+                return Ok(None);
             }
             Ok(self.by_msg_id.clone())
         }
-        async fn set_flags(
+        fn set_flags(
             &mut self,
             folder: &str,
             uid: u32,
@@ -4067,35 +4097,35 @@ mod tests {
             }
             Ok(())
         }
-        async fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.moved.push((folder.to_owned(), uid, dest.to_owned()));
             Ok(())
         }
-        async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.moved.push((folder.to_owned(), uid, dest.to_owned()));
             Ok(())
         }
-        async fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.expunged.push((folder.to_owned(), uid));
             Ok(())
         }
-        async fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
+        fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.appended.push((folder.to_owned(), message.to_vec()));
             Ok(())
         }
-        async fn fetch_threads(&mut self, _folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
+        fn fetch_threads(&mut self, _folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
@@ -4104,6 +4134,7 @@ mod tests {
     }
 
     struct MockSmtp {
+        #[allow(clippy::type_complexity)]
         sent: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, MailBody)>>>,
         cc_sent: Vec<Vec<String>>,
         bcc_sent: Vec<Vec<String>>,
@@ -4132,9 +4163,8 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl SmtpBackend for MockSmtp {
-        async fn send(
+        fn send(
             &mut self,
             from: &str,
             to: &[&str],
@@ -4173,6 +4203,60 @@ mod tests {
             flagged: false,
             message_id: format!("<msg{uid}@example.com>"),
         }
+    }
+
+    /// A provider on the background path (no mock injected), in INBOX with
+    /// its two messages listed.
+    fn bg_provider_in_inbox() -> EmailClientProvider {
+        let mut p = EmailClientProvider::new().with_oauth_token("fake");
+        p.message_cache = vec![
+            make_header(1, "alice@x.com", "Alpha"),
+            make_header(2, "bob@x.com", "Beta"),
+        ];
+        p.envelope_cache_folder = "INBOX".to_owned();
+        p.envelope_cache = Some(envelope_items(&p.message_cache, 50));
+        p.special_folders.trash = Some("Trash".to_owned());
+        p.current_path = "/INBOX".to_owned();
+        p
+    }
+
+    fn rows(p: &EmailClientProvider) -> Vec<String> {
+        p.envelope_cache
+            .as_ref()
+            .expect("the folder's rows are kept")
+            .iter()
+            .map(|e| match e {
+                FfonElement::Str(s) => s.clone(),
+                FfonElement::Obj(o) => o.key.clone(),
+            })
+            .collect()
+    }
+
+    /// In the background the server has not answered yet when the list is
+    /// drawn again, so dropping the rows would show "Loading…" in place of
+    /// the folder. They follow the change instead.
+    #[test]
+    fn a_background_delete_keeps_the_rest_of_the_folder_on_screen() {
+        let mut p = bg_provider_in_inbox();
+        let mut err = String::new();
+        p.handle_command("delete", "[read] Alpha — alice@x.com", 0, &mut err);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(rows(&p), ["[read] Beta — bob@x.com"]);
+    }
+
+    #[test]
+    fn a_background_flag_change_relabels_the_row_in_place() {
+        let mut p = bg_provider_in_inbox();
+        let mut err = String::new();
+        p.handle_command("star", "[read] Beta — bob@x.com", 0, &mut err);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            rows(&p),
+            [
+                "[read] Alpha — alice@x.com",
+                "[read] [star] Beta — bob@x.com"
+            ]
+        );
     }
 
     fn make_header_unread(uid: u32, from: &str, subject: &str) -> MessageHeader {
@@ -4227,7 +4311,7 @@ mod tests {
         assert!(
             items[0]
                 .as_str()
-                .map_or(false, |s| s.contains("<button>login</button>"))
+                .is_some_and(|s| s.contains("<button>login</button>"))
         );
     }
 
@@ -4238,7 +4322,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_str().map_or(false, |s| s.contains("not configured")) })
+                .any(|e| { e.as_str().is_some_and(|s| s.contains("not configured")) })
         );
     }
 
@@ -4252,7 +4336,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "compose"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "compose"))
         );
     }
 
@@ -4266,17 +4350,17 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "INBOX"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "INBOX"))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "Sent"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "Sent"))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "Drafts"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "Drafts"))
         );
     }
 
@@ -4290,7 +4374,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("IMAP error")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("IMAP error")))
         );
     }
 
@@ -4303,11 +4387,11 @@ mod tests {
         let items = p.fetch();
         let inbox_pos = items
             .iter()
-            .position(|e| e.as_obj().map_or(false, |o| o.key == "INBOX"))
+            .position(|e| e.as_obj().is_some_and(|o| o.key == "INBOX"))
             .unwrap();
         let compose_pos = items
             .iter()
-            .position(|e| e.as_obj().map_or(false, |o| o.key == "compose"))
+            .position(|e| e.as_obj().is_some_and(|o| o.key == "compose"))
             .unwrap();
         assert_eq!(compose_pos, inbox_pos + 1);
     }
@@ -4323,12 +4407,12 @@ mod tests {
         assert!(
             !items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "[Gmail]"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "[Gmail]"))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "Sent"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "Sent"))
         );
     }
 
@@ -4390,7 +4474,7 @@ mod tests {
         assert!(
             items[0]
                 .as_str()
-                .map_or(false, |s| s.contains("<button>login</button>"))
+                .is_some_and(|s| s.contains("<button>login</button>"))
         );
     }
 
@@ -4555,19 +4639,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_bg_imap_forces_a_reconnect() {
-        let mut p = EmailClientProvider::new();
-        p.config.imap_url = "imaps://imap.example.com".to_owned();
-        p.config.username = "user@example.com".to_owned();
-        let _ = p.bg_imap();
-        assert!(p.bg_imap.is_some());
-
-        // The open connection authenticated with the previous credentials.
-        p.reset_bg_imap();
-        assert!(p.bg_imap.is_none());
-    }
-
-    #[test]
     fn test_finish_login_clears_folder_cache_and_resets_path() {
         // finish_login must always clear session state so the next fetch
         // issues a fresh IMAP folder list with the new token.
@@ -4623,12 +4694,12 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Hello")))
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Hello")))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("World")))
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("World")))
         );
     }
 
@@ -4641,7 +4712,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_obj()
-                .map_or(false, |o| o.key == "[read] Subject — alice@x.com")
+                .is_some_and(|o| o.key == "[read] Subject — alice@x.com")
         }));
     }
 
@@ -4655,7 +4726,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_obj().map_or(false, |o| o.key.contains("(no subject)")) })
+                .any(|e| { e.as_obj().is_some_and(|o| o.key.contains("(no subject)")) })
         );
     }
 
@@ -4715,22 +4786,22 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("From:")))
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("From:")))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("To:")))
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("To:")))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("Subject:")))
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("Subject:")))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("Date:")))
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("Date:")))
         );
     }
 
@@ -4744,11 +4815,7 @@ mod tests {
         p.fetch();
         p.push_path("[read] Hello — alice@example.com");
         let items = p.fetch();
-        assert!(
-            items
-                .iter()
-                .any(|e| e.as_str().map_or(false, |s| s == "Hi Bob!"))
-        );
+        assert!(items.iter().any(|e| e.as_str() == Some("Hi Bob!")));
     }
 
     #[test]
@@ -4764,17 +4831,17 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "reply"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "reply"))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "reply all"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "reply all"))
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "forward"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "forward"))
         );
     }
 
@@ -4880,7 +4947,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Previous"))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Previous"))),
             "History must find the message via \\All folder; got: {:?}",
             items
         );
@@ -4911,7 +4978,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Re: Hello"))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Re: Hello"))),
             "History must surface thread sibling via thread cache; got: {:?}",
             items
         );
@@ -4925,12 +4992,10 @@ mod tests {
         p.config.username = "me@example.com".to_owned();
         p.push_path("compose");
         let items = p.fetch();
-        assert!(
-            items
-                .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("From:")
-                    && s.contains("me@example.com")))
-        );
+        assert!(items.iter().any(|e| {
+            e.as_str()
+                .is_some_and(|s| s.starts_with("From:") && s.contains("me@example.com"))
+        }));
     }
 
     #[test]
@@ -4966,11 +5031,11 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("To:") && s.contains("<input>"))
+                .is_some_and(|s| s.contains("To:") && s.contains("<input>"))
         }));
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("Subject:") && s.contains("<input>"))
+                .is_some_and(|s| s.contains("Subject:") && s.contains("<input>"))
         }));
         // Body: is an Obj node; an empty draft body has no children yet (user inserts via Ctrl+I).
         assert!(items.iter().any(|e| {
@@ -4989,7 +5054,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<button>send</button>"))
+                .is_some_and(|s| s.contains("<button>send</button>"))
         }));
     }
 
@@ -5004,7 +5069,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("message sent")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("message sent")))
         );
     }
 
@@ -6260,10 +6325,10 @@ mod tests {
         let nested = elems
             .iter()
             .find_map(|e| {
-                if let FfonElement::Obj(o) = e {
-                    if sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("section") {
-                        return Some(o);
-                    }
+                if let FfonElement::Obj(o) = e
+                    && sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("section")
+                {
+                    return Some(o);
                 }
                 None
             })
@@ -6305,10 +6370,10 @@ mod tests {
         let nested = elems
             .iter()
             .find_map(|e| {
-                if let FfonElement::Obj(o) = e {
-                    if sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("attachment") {
-                        return Some(o);
-                    }
+                if let FfonElement::Obj(o) = e
+                    && sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("attachment")
+                {
+                    return Some(o);
                 }
                 None
             })
@@ -6424,10 +6489,10 @@ mod tests {
             .children
             .iter()
             .find_map(|c| {
-                if let FfonElement::Obj(o) = c {
-                    if sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("baz") {
-                        return Some(o);
-                    }
+                if let FfonElement::Obj(o) = c
+                    && sicompass_sdk::tags::extract_input(&o.key).as_deref() == Some("baz")
+                {
+                    return Some(o);
                 }
                 None
             })
@@ -6517,13 +6582,13 @@ mod tests {
         assert!(
             children
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Alpha"))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Alpha"))),
             "children must include message with subject Alpha"
         );
         assert!(
             children
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Beta"))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Beta"))),
             "children must include message with subject Beta"
         );
     }
@@ -6654,7 +6719,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.starts_with("[unread] "))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.starts_with("[unread] "))),
             "unread message should have [unread] prefix in list; got: {:?}",
             items
         );
@@ -6670,7 +6735,7 @@ mod tests {
         assert!(
             !items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.starts_with("[unread] "))),
+                .any(|e| e.as_obj().is_some_and(|o| o.key.starts_with("[unread] "))),
             "seen message should not have [unread] prefix; got: {:?}",
             items
         );
@@ -7248,6 +7313,24 @@ mod tests {
         }
     }
 
+    /// On a folder's message list the commands act on the row under the
+    /// cursor, so they are offered there: without "delete" in the list, Ctrl+D
+    /// on the list did nothing at all.
+    #[test]
+    fn test_message_commands_offered_on_a_message_list() {
+        let msgs = vec![make_header(1, "alice@example.com", "Hello")];
+        let imap = MockImap::new().with_messages(msgs);
+        let mut p = EmailClientProvider::new()
+            .with_oauth_token("fake")
+            .with_imap(Box::new(imap));
+        p.push_path("INBOX");
+        p.fetch();
+        let cmds = p.commands();
+        for cmd in ["mark-read", "star", "delete", "archive", "move"] {
+            assert!(cmds.contains(&cmd.to_owned()), "{cmd} missing: {cmds:?}");
+        }
+    }
+
     #[test]
     fn test_message_commands_hidden_at_root() {
         let p = EmailClientProvider::new().with_oauth_token("fake");
@@ -7278,13 +7361,13 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("Cc:"))),
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("Cc:"))),
             "compose view must include a Cc: field"
         );
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.starts_with("Bcc:"))),
+                .any(|e| e.as_str().is_some_and(|s| s.starts_with("Bcc:"))),
             "compose view must include a Bcc: field"
         );
     }
@@ -7354,7 +7437,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("load-more"))),
+                .any(|e| e.as_str().is_some_and(|s| s.contains("load-more"))),
             "folder at limit must show load-more button; items: {:?}",
             items
         );
@@ -7392,7 +7475,7 @@ mod tests {
         let items = build_message_view(&msg);
         let attach_obj = items
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key == "Attachments"));
+            .find(|e| e.as_obj().is_some_and(|o| o.key == "Attachments"));
         assert!(
             attach_obj.is_some(),
             "message view must have Attachments obj when attachments are present"
@@ -7401,7 +7484,7 @@ mod tests {
         assert!(
             children
                 .iter()
-                .any(|c| c.as_str().map_or(false, |s| s.contains("report.pdf"))),
+                .any(|c| c.as_str().is_some_and(|s| s.contains("report.pdf"))),
             "Attachments obj must list the filename; children: {:?}",
             children
         );
@@ -7414,7 +7497,7 @@ mod tests {
         assert!(
             !items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "Attachments")),
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "Attachments")),
             "message view must not include Attachments obj when there are none"
         );
     }
@@ -7516,20 +7599,16 @@ mod tests {
         assert!(err.is_empty(), "{err}");
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::ImapOp {
-                op:
-                    ImapOpKind::SetSeen {
-                        msg_uid,
-                        folder,
-                        new,
-                        ..
-                    },
+        match decode_op(&entries[0]) {
+            Some(ImapOpKind::SetSeen {
+                msg_uid,
+                folder,
+                new,
                 ..
-            } => {
-                assert_eq!(*msg_uid, 1);
+            }) => {
+                assert_eq!(msg_uid, 1);
                 assert_eq!(folder, "INBOX");
-                assert!(*new);
+                assert!(new);
             }
             other => panic!("expected ImapOp::SetSeen, got {:?}", other),
         }
@@ -7553,15 +7632,12 @@ mod tests {
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
-            &entries[0],
-            TimelineEntry::ImapOp {
-                op: ImapOpKind::SetFlagged {
-                    msg_uid: 1,
-                    new: true,
-                    ..
-                },
+            decode_op(&entries[0]),
+            Some(ImapOpKind::SetFlagged {
+                msg_uid: 1,
+                new: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -7590,7 +7666,7 @@ mod tests {
         unsafe {
             (*mock).stored_flags.clear();
         }
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0], &mut err);
         assert!(err.is_empty(), "{err}");
         let stored = unsafe { &(*mock).stored_flags };
         assert!(
@@ -7604,43 +7680,326 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// SDK registration
+// The plugin
 // ---------------------------------------------------------------------------
 
-/// Register the email client with the SDK factory and manifest registries.
-pub fn register() {
-    sicompass_sdk::register_provider_factory(
-        "emailclient",
-        || Box::new(EmailClientProvider::new()),
-    );
-    sicompass_sdk::register_builtin_manifest(
-        sicompass_sdk::BuiltinManifest::new("emailclient", "email client").with_settings(vec![
-            sicompass_sdk::SettingDecl::text(
-                "email client",
-                "IMAP URL",
-                "emailImapUrl",
-                "imaps://imap.gmail.com",
-            ),
-            sicompass_sdk::SettingDecl::text(
-                "email client",
-                "SMTP URL",
-                "emailSmtpUrl",
-                "smtps://smtp.gmail.com",
-            ),
-            sicompass_sdk::SettingDecl::text("email client", "username", "emailUsername", ""),
-            sicompass_sdk::SettingDecl::password("email client", "password", "emailPassword", ""),
-            sicompass_sdk::SettingDecl::text(
-                "email client",
-                "client ID (OAuth)",
-                "emailClientId",
-                "",
-            ),
-            sicompass_sdk::SettingDecl::password(
-                "email client",
-                "client secret (OAuth)",
-                "emailClientSecret",
-                "",
-            ),
-        ]),
-    );
+impl Plugin for EmailClientProvider {
+    fn new() -> Self {
+        EmailClientProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            no_cache: self.no_cache(),
+            ..Default::default()
+        }
+    }
+
+    fn init(&mut self) {
+        EmailClientProvider::init(self);
+    }
+
+    fn cleanup(&mut self) {
+        EmailClientProvider::cleanup(self);
+    }
+
+    /// Finished background work asks for a redraw, new mail (IDLE) for a
+    /// refresh, and errors are reported one per frame.
+    fn poll(&mut self) -> PollResult {
+        let redraw = self.tick();
+        let needs_refresh = self.needs_refresh();
+        if needs_refresh {
+            self.clear_needs_refresh();
+        }
+        PollResult {
+            redraw,
+            needs_refresh,
+            at_root: self.path_segments().is_empty(),
+            error: self.take_error(),
+            ..Default::default()
+        }
+    }
+
+    fn fetch(&mut self) -> Vec<FfonElement> {
+        EmailClientProvider::fetch(self)
+    }
+
+    fn current_path(&self) -> &str {
+        &self.current_path
+    }
+
+    fn set_current_path(&mut self, path: &str) {
+        EmailClientProvider::set_current_path(self, path);
+    }
+
+    fn push_path(&mut self, segment: &str) {
+        EmailClientProvider::push_path(self, segment);
+    }
+
+    fn pop_path(&mut self) {
+        EmailClientProvider::pop_path(self);
+    }
+
+    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
+        EmailClientProvider::commit_edit(self, old, new)
+    }
+
+    fn on_button_press(&mut self, function_name: &str) {
+        EmailClientProvider::on_button_press(self, function_name);
+    }
+
+    fn commands(&self) -> Vec<String> {
+        EmailClientProvider::commands(self)
+    }
+
+    fn handle_command(
+        &mut self,
+        cmd: &str,
+        elem_key: &str,
+        elem_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out = EmailClientProvider::handle_command(self, cmd, elem_key, elem_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn command_list_items(&self, cmd: &str) -> Vec<sicompass_pdk::ListItem> {
+        EmailClientProvider::command_list_items(self, cmd)
+            .into_iter()
+            .map(|i| sicompass_pdk::ListItem {
+                label: i.label,
+                data: i.data,
+            })
+            .collect()
+    }
+
+    fn execute_command(&mut self, cmd: &str, selection: &str) -> bool {
+        EmailClientProvider::execute_command(self, cmd, selection)
+    }
+
+    fn on_setting_change(&mut self, key: &str, value: &str) {
+        EmailClientProvider::on_setting_change(self, key, value);
+    }
+
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
+        EmailClientProvider::take_timeline_entries(self)
+    }
+
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        EmailClientProvider::undo(self, entry, &mut error);
+        if error.is_empty() { Ok(()) } else { Err(error) }
+    }
+
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        EmailClientProvider::redo(self, entry, &mut error);
+        if error.is_empty() { Ok(()) } else { Err(error) }
+    }
+
+    fn collect_extended_search_items(&self) -> Option<Vec<sicompass_pdk::SearchResult>> {
+        EmailClientProvider::collect_extended_search_items(self).map(|items| {
+            items
+                .into_iter()
+                .map(|i| sicompass_pdk::SearchResult {
+                    label: i.label,
+                    breadcrumb: i.breadcrumb,
+                    nav_path: i.nav_path,
+                })
+                .collect()
+        })
+    }
+
+    fn fetch_subtree_children(&mut self) -> Option<Vec<FfonElement>> {
+        EmailClientProvider::fetch_subtree_children(self)
+    }
+
+    fn fetch_subtree_parent_key(&mut self) -> Option<String> {
+        EmailClientProvider::fetch_subtree_parent_key(self)
+    }
+
+    fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
+        EmailClientProvider::sync_ffon_body_children(self, children);
+    }
+
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        match name {
+            #[cfg(target_arch = "wasm32")]
+            worker::WORKER_TASK => worker::run_worker_task(input),
+            #[cfg(target_arch = "wasm32")]
+            idle::IDLE_TASK => idle::run_idle_task(input),
+            #[cfg(target_arch = "wasm32")]
+            oauth2::OAUTH_TASK => oauth2::run_oauth_task(input),
+            other => {
+                let _ = input;
+                Err(format!("emailclient has no task named `{other}`"))
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
+        if self.idle.on_task_event(id, &event) {
+            return;
+        }
+        if let Some(login) = &self.active_login
+            && login.on_task_event(id, &event)
+        {
+            return;
+        }
+        let answer = self
+            .worker
+            .as_ref()
+            .and_then(|w| w.on_task_event(id, &event));
+        match answer {
+            Some(Ok(done)) => self.apply_done(done),
+            Some(Err(e)) => {
+                // The worker is gone; the next job starts another. Whatever it
+                // had in flight is not coming, so nothing may wait on it.
+                self.worker = None;
+                self.folder_fetch_inflight.store(false, Ordering::Release);
+                self.message_fetch_inflight.store(false, Ordering::Release);
+                self.send_inflight.store(false, Ordering::Release);
+                self.token_refresh_inflight.store(false, Ordering::Release);
+                self.message_fetch_key = None;
+                self.envelope_fetch_key = None;
+                self.thread_fetch_key = None;
+                self.history_fetch_key = None;
+                self.bg_errors.lock().unwrap().push(e);
+                self.bg_completed.store(true, Ordering::Release);
+            }
+            None => {}
+        }
+    }
+}
+
+export_plugin!(EmailClientProvider);
+
+/// Where the sign-in (the OAuth tokens, and the servers and address it filled
+/// in) is kept: the plugin's storage folder (`permissions.storage`), in the
+/// shape of a settings file with one `email client` section. Natively (the
+/// tests) nowhere unless a test names one.
+fn default_state_path() -> Option<std::path::PathBuf> {
+    if cfg!(target_arch = "wasm32") {
+        Some(std::path::PathBuf::from(sicompass_pdk::STORAGE_DIR).join("email.json"))
+    } else {
+        None
+    }
+}
+
+/// A recorded action as the provider op the app keeps on its timeline: the
+/// variant's name, and its fields as an FFON list.
+fn encode_op(op: &ImapOpKind) -> ProviderOp {
+    let flag = |b: &bool| if *b { "1" } else { "0" }.to_owned();
+    let (command, label, parts): (&str, &str, Vec<String>) = match op {
+        ImapOpKind::Trash {
+            msg_id,
+            src_folder,
+            trash_folder,
+        } => (
+            "trash",
+            "delete message",
+            vec![msg_id.clone(), src_folder.clone(), trash_folder.clone()],
+        ),
+        ImapOpKind::Archive {
+            msg_id,
+            src_folder,
+            archive_folder,
+        } => (
+            "archive",
+            "archive message",
+            vec![msg_id.clone(), src_folder.clone(), archive_folder.clone()],
+        ),
+        ImapOpKind::Move {
+            msg_id,
+            src_folder,
+            dst_folder,
+        } => (
+            "move",
+            "move message",
+            vec![msg_id.clone(), src_folder.clone(), dst_folder.clone()],
+        ),
+        ImapOpKind::SetSeen {
+            msg_uid,
+            folder,
+            prev,
+            new,
+        } => (
+            "set-seen",
+            if *new { "mark read" } else { "mark unread" },
+            vec![msg_uid.to_string(), folder.clone(), flag(prev), flag(new)],
+        ),
+        ImapOpKind::SetFlagged {
+            msg_uid,
+            folder,
+            prev,
+            new,
+        } => (
+            "set-flagged",
+            if *new { "star" } else { "unstar" },
+            vec![msg_uid.to_string(), folder.clone(), flag(prev), flag(new)],
+        ),
+    };
+    let mut payload = FfonElement::new_obj(command);
+    if let Some(o) = payload.as_obj_mut() {
+        for part in parts {
+            o.push(FfonElement::new_str(part));
+        }
+    }
+    ProviderOp {
+        command: command.to_owned(),
+        payload: sicompass_pdk::encode_one(&payload),
+        label: label.to_owned(),
+    }
+}
+
+/// The action a provider op records, if it is one of ours.
+fn decode_op(entry: &ProviderOp) -> Option<ImapOpKind> {
+    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let parts: Vec<String> = payload
+        .as_obj()?
+        .children
+        .iter()
+        .filter_map(|c| c.as_str().map(str::to_owned))
+        .collect();
+    let at = |i: usize| parts.get(i).cloned().unwrap_or_default();
+    let flag = |i: usize| at(i) == "1";
+    let uid = || at(0).parse::<u32>().ok();
+    Some(match entry.command.as_str() {
+        "trash" => ImapOpKind::Trash {
+            msg_id: at(0),
+            src_folder: at(1),
+            trash_folder: at(2),
+        },
+        "archive" => ImapOpKind::Archive {
+            msg_id: at(0),
+            src_folder: at(1),
+            archive_folder: at(2),
+        },
+        "move" => ImapOpKind::Move {
+            msg_id: at(0),
+            src_folder: at(1),
+            dst_folder: at(2),
+        },
+        "set-seen" => ImapOpKind::SetSeen {
+            msg_uid: uid()?,
+            folder: at(1),
+            prev: flag(2),
+            new: flag(3),
+        },
+        "set-flagged" => ImapOpKind::SetFlagged {
+            msg_uid: uid()?,
+            folder: at(1),
+            prev: flag(2),
+            new: flag(3),
+        },
+        _ => return None,
+    })
 }

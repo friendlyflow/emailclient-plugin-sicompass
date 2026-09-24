@@ -1,17 +1,34 @@
 //! Google OAuth2 authorization flow — port of `oauth2.c`.
 //!
-//! Uses a local HTTP server on a random port to receive the redirect code,
-//! then exchanges it for tokens via the Google token endpoint.
+//! The browser comes back to a loopback port with the authorization code,
+//! which is exchanged for tokens at the Google token endpoint. In the sandbox a
+//! plugin cannot listen, so the host does it (`desktop.oauth-redirect`), in a
+//! task ([`OAUTH_TASK`]) since it waits for the user. Natively, for the tests,
+//! a thread listens itself.
 
-use reqwest::blocking::Client;
-use serde::Deserialize;
+use crate::http::Client;
+use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::TcpListener;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+/// The task that runs a sign-in in the sandbox.
+pub const OAUTH_TASK: &str = "oauth";
+
+/// Seconds since the Unix epoch.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -19,13 +36,16 @@ const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo
 const OAUTH2_SCOPE: &str = "https://mail.google.com/ email profile";
 
 /// Result of an OAuth2 token operation — mirrors `OAuth2TokenResult` from C.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OAuth2TokenResult {
     pub success: bool,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
     pub error: String,
+    /// The signed-in address, when the sign-in already asked for it.
+    #[serde(default)]
+    pub email: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -34,12 +54,143 @@ pub struct OAuth2TokenResult {
 
 /// An in-flight OAuth2 authorization request. Created by [`start`]; poll it
 /// each frame with [`PendingAuthorize::poll`] until it returns `Some`.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PendingAuthorize {
     rx: std::sync::mpsc::Receiver<OAuth2TokenResult>,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
 }
 
+/// In the sandbox: the sign-in task, and its answer once it came.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub struct PendingAuthorize {
+    task: u64,
+    result: std::cell::RefCell<Option<OAuth2TokenResult>>,
+    deadline: Instant,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PendingAuthorize {
+    /// Non-blocking check, as natively.
+    pub fn poll(&self) -> Option<OAuth2TokenResult> {
+        if let Some(r) = self.result.borrow_mut().take() {
+            return Some(r);
+        }
+        if Instant::now() >= self.deadline {
+            self.cancel();
+            return Some(OAuth2TokenResult {
+                error: "timed out waiting for Google authorization".to_owned(),
+                ..Default::default()
+            });
+        }
+        None
+    }
+
+    pub fn cancel(&self) {
+        sicompass_pdk::tasks::cancel(self.task);
+    }
+
+    /// The sign-in task's answer. `true` when the event was its.
+    pub fn on_task_event(&self, id: u64, event: &sicompass_pdk::TaskEvent) -> bool {
+        if id != self.task {
+            return false;
+        }
+        let answer = match event {
+            sicompass_pdk::TaskEvent::Progress(_) => return true,
+            sicompass_pdk::TaskEvent::Done(Ok(bytes)) => serde_json::from_slice(bytes)
+                .unwrap_or_else(|e| OAuth2TokenResult {
+                    error: format!("sign-in: {e}"),
+                    ..Default::default()
+                }),
+            sicompass_pdk::TaskEvent::Done(Err(e)) => OAuth2TokenResult {
+                error: format!("sign-in stopped: {e}"),
+                ..Default::default()
+            },
+        };
+        *self.result.borrow_mut() = Some(answer);
+        true
+    }
+}
+
+/// Start the sign-in in the sandbox: a task that asks the host to run the
+/// browser redirect, then exchanges the code.
+#[cfg(target_arch = "wasm32")]
+pub fn start(
+    client_id: &str,
+    client_secret: &str,
+    timeout_secs: u64,
+) -> Result<PendingAuthorize, OAuth2TokenResult> {
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(OAuth2TokenResult {
+            error: "client ID and client secret are required".to_owned(),
+            ..Default::default()
+        });
+    }
+    let job = serde_json::json!({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "timeout": timeout_secs,
+    });
+    let task =
+        sicompass_pdk::tasks::spawn(OAUTH_TASK, job.to_string().as_bytes()).map_err(|e| {
+            OAuth2TokenResult {
+                error: format!("cannot start the sign-in: {e}"),
+                ..Default::default()
+            }
+        })?;
+    Ok(PendingAuthorize {
+        task,
+        result: std::cell::RefCell::new(None),
+        // A little past the host's own wait, so its answer arrives first.
+        deadline: Instant::now() + Duration::from_secs(timeout_secs + 15),
+    })
+}
+
+/// The sign-in task itself, in the sandbox.
+#[cfg(target_arch = "wasm32")]
+pub fn run_oauth_task(input: &[u8]) -> Result<Vec<u8>, String> {
+    let job: serde_json::Value = serde_json::from_slice(input).map_err(|e| e.to_string())?;
+    let field = |k: &str| job.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let (client_id, client_secret) = (field("client_id"), field("client_secret"));
+    let timeout = job.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
+    let auth_url = format!(
+        "{GOOGLE_AUTH_URL}?client_id={client_id}&redirect_uri={{redirect-uri}}&\
+         response_type=code&scope={scope}&access_type=offline&prompt=consent",
+        client_id = percent_encode(&client_id),
+        scope = percent_encode(OAUTH2_SCOPE),
+    );
+    let result = match sicompass_pdk::desktop::oauth_redirect(&auth_url, timeout) {
+        Err(e) => OAuth2TokenResult {
+            error: e,
+            ..Default::default()
+        },
+        Ok(reply) => {
+            let line = format!("GET /?{} HTTP/1.1", reply.query);
+            if reply.query.split('&').any(|kv| kv.starts_with("error=")) {
+                OAuth2TokenResult {
+                    error: "Google returned an error response".to_owned(),
+                    ..Default::default()
+                }
+            } else if let Some(code) = extract_query_param(&line, "code") {
+                let mut tokens =
+                    exchange_code(&code, &client_id, &client_secret, &reply.redirect_uri);
+                if tokens.success {
+                    tokens.email = fetch_email(&tokens.access_token).unwrap_or_default();
+                }
+                tokens
+            } else {
+                OAuth2TokenResult {
+                    error: "no authorization code in redirect".to_owned(),
+                    ..Default::default()
+                }
+            }
+        }
+    };
+    serde_json::to_vec(&result).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for PendingAuthorize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAuthorize")
@@ -48,6 +199,7 @@ impl std::fmt::Debug for PendingAuthorize {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PendingAuthorize {
     /// Non-blocking check. Returns `Some(result)` once the worker finishes
     /// (success, error, or timeout), `None` while still waiting.
@@ -90,6 +242,7 @@ impl PendingAuthorize {
 /// that waits for the redirect, and returns a [`PendingAuthorize`] handle
 /// immediately. Call [`PendingAuthorize::poll`] each frame until it returns
 /// `Some`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn start(
     client_id: &str,
     client_secret: &str,
@@ -129,7 +282,9 @@ pub fn start(
         redir = percent_encode(&redirect_uri),
         scope = percent_encode(OAUTH2_SCOPE),
     );
-    sicompass_sdk::platform::open_with_default(&auth_url);
+    // Natively this flow is the tests', which play the browser themselves, so
+    // nothing is opened. In the sandbox the host opens it (`run_oauth_task`).
+    let _ = auth_url;
 
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<OAuth2TokenResult>();
@@ -158,6 +313,7 @@ pub fn start(
 /// Start the OAuth2 authorization flow and block until completion or timeout.
 ///
 /// Convenience wrapper for callers (and tests) that can afford to block.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn authorize(client_id: &str, client_secret: &str, timeout_secs: u64) -> OAuth2TokenResult {
     match start(client_id, client_secret, timeout_secs) {
         Err(e) => e,
@@ -223,6 +379,7 @@ pub fn refresh_token(client_id: &str, client_secret: &str, refresh_tok: &str) ->
 /// Worker: non-blocking accept loop that checks `cancel` between attempts.
 /// On a successful connection it reads the request, sends the success page,
 /// and exchanges the auth code — all on this worker thread.
+#[cfg(not(target_arch = "wasm32"))]
 fn accept_and_exchange(
     listener: TcpListener,
     cancel: &AtomicBool,
@@ -371,7 +528,7 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-fn parse_token_response(response: reqwest::blocking::Response) -> OAuth2TokenResult {
+fn parse_token_response(response: crate::http::Response) -> OAuth2TokenResult {
     let text = match response.text() {
         Ok(t) => t,
         Err(e) => {

@@ -1,12 +1,15 @@
 //! Production IMAP and SMTP backends.
 //!
-//! `RealImap` implements `ImapBackend` on top of `async-imap` +
-//! `async-native-tls`; `RealSmtp` implements `SmtpBackend` on lettre's async
-//! transport. Both are instantiated lazily from `EmailClientConfig` in `init()`.
+//! `RealImap` implements `ImapBackend` on the blocking `imap` crate over the
+//! TLS stream in `connection.rs`; `RealSmtp` implements `SmtpBackend` by
+//! speaking SMTP itself over the same kind of stream, with lettre building the
+//! message. Both are built from `EmailClientConfig`, and both block: in the
+//! sandbox they run in the plugin's worker task, natively on its thread,
+//! never in a call from the app.
 //!
-//! Every exchange is bounded by [`IMAP_TIMEOUT`]. The previous blocking backend
-//! never called `set_read_timeout`, so a server that accepted the connection and
-//! then went silent would block the caller forever.
+//! Every read and write is bounded by [`IMAP_TIMEOUT`] (the socket timeouts
+//! `connection.rs` sets), so a server that accepted the connection and then
+//! went silent fails the exchange instead of blocking it forever.
 
 use crate::cache::EnvelopeCache;
 use crate::connection::{ImapSession, RawImap, connect_imap};
@@ -14,38 +17,15 @@ use crate::{
     EmailAttachment, EmailClientConfig, EmailMessage, FolderInfo, ImapBackend, MailBody,
     MessageHeader, SmtpBackend,
 };
-use async_imap::imap_proto::types::Address;
-use async_imap::types::Fetch;
-use async_trait::async_trait;
-use futures::TryStreamExt;
+use imap::types::Fetch;
+use imap_proto::types::Address;
+use lettre::Message;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment as LettreAttachment, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use std::time::Duration;
 
-/// Upper bound on a single IMAP or SMTP exchange.
-pub const IMAP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Run `$inner` under [`IMAP_TIMEOUT`], dropping the session when it expires.
-///
-/// The future is bound to a `let` first so that its borrow of `$self` has ended
-/// by the time `reset_session` needs `&mut $self` again.
-macro_rules! timed {
-    ($self:ident, $inner:expr) => {{
-        let outcome = tokio::time::timeout(IMAP_TIMEOUT, $inner).await;
-        match outcome {
-            Ok(result) => result,
-            Err(_) => {
-                $self.reset_session().await;
-                Err(format!(
-                    "IMAP server did not respond within {}s",
-                    IMAP_TIMEOUT.as_secs()
-                ))
-            }
-        }
-    }};
-}
+/// Upper bound on a single IMAP or SMTP read or write.
+pub const IMAP_TIMEOUT: Duration = crate::connection::IO_TIMEOUT;
 
 // ---------------------------------------------------------------------------
 // RealImap
@@ -54,7 +34,12 @@ macro_rules! timed {
 pub struct RealImap {
     config: EmailClientConfig,
     session: Option<ImapSession>,
+    /// Opened on first use, so a copy that never lists a folder (the UI's,
+    /// when the worker does the fetching) never opens the database: two
+    /// instances writing one SQLite file from separate sandboxes is asking
+    /// for a corrupt cache.
     cache: Option<EnvelopeCache>,
+    cache_opened: bool,
     /// Separate connection used only for `UID THREAD`; see `fetch_threads`.
     /// Opened lazily on first use and reused across folders.
     thread_conn: Option<RawImap>,
@@ -62,27 +47,29 @@ pub struct RealImap {
 
 impl RealImap {
     pub fn from_config(config: &EmailClientConfig) -> Self {
-        let cache = if config.username.is_empty() {
-            None
-        } else {
-            EnvelopeCache::open(&config.username)
-        };
         RealImap {
             config: config.clone(),
             session: None,
-            cache,
+            cache: None,
+            cache_opened: false,
             thread_conn: None,
         }
     }
 
+    /// Open the envelope cache the first time it is wanted.
+    fn open_cache(&mut self) {
+        if !self.cache_opened {
+            self.cache_opened = true;
+            if !self.config.username.is_empty() {
+                self.cache = EnvelopeCache::open(&self.config.username);
+            }
+        }
+    }
+
     /// Open the session if it is not already live.
-    ///
-    /// Returning `()` rather than `&mut ImapSession` keeps the borrow of `self`
-    /// from outliving the call, so callers can still reach `reset_session` on
-    /// the error path.
-    async fn ensure_session(&mut self) -> Result<(), String> {
+    fn ensure_session(&mut self) -> Result<(), String> {
         if self.session.is_none() {
-            self.session = Some(connect_imap(&self.config).await?);
+            self.session = Some(connect_imap(&self.config)?);
         }
         Ok(())
     }
@@ -93,26 +80,28 @@ impl RealImap {
     }
 
     /// Invalidate the cached session (called after errors and timeouts).
-    async fn reset_session(&mut self) {
+    fn reset_session(&mut self) {
         if let Some(mut s) = self.session.take() {
             // Best effort: the session is being discarded either way, and after
             // a timeout the server is by definition not answering.
-            let _ = tokio::time::timeout(Duration::from_secs(5), s.logout()).await;
+            let _ = s.logout();
         }
     }
 
-    async fn list_folders_inner(&mut self) -> Result<Vec<FolderInfo>, String> {
-        self.ensure_session().await?;
-        let session = self.session_mut();
+    /// Run `op`, dropping the session when it fails so the next call
+    /// reconnects rather than reusing a half-open connection.
+    fn guarded<R>(&mut self, op: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
+        let out = op(self);
+        if out.is_err() {
+            self.reset_session();
+        }
+        out
+    }
 
-        let stream = session
-            .list(None, Some("*"))
-            .await
-            .map_err(|e| e.to_string())?;
-        let names: Vec<async_imap::types::Name> = Box::pin(stream)
-            .try_collect()
-            .await
-            .map_err(|e| e.to_string())?;
+    fn list_folders_inner(&mut self) -> Result<Vec<FolderInfo>, String> {
+        self.ensure_session()?;
+        let session = self.session_mut();
+        let names = session.list(None, Some("*")).map_err(|e| e.to_string())?;
 
         let folders: Vec<FolderInfo> = names
             .iter()
@@ -120,7 +109,7 @@ impl RealImap {
                 // Skip \Noselect folders (containers).
                 if n.attributes()
                     .iter()
-                    .any(|a| matches!(a, async_imap::types::NameAttribute::NoSelect))
+                    .any(|a| matches!(a, imap_proto::types::NameAttribute::NoSelect))
                 {
                     return None;
                 }
@@ -135,7 +124,7 @@ impl RealImap {
                     .attributes()
                     .iter()
                     .map(|a| {
-                        use async_imap::types::NameAttribute as NA;
+                        use imap_proto::types::NameAttribute as NA;
                         match a {
                             NA::NoInferiors => "\\Noinferiors".to_owned(),
                             NA::NoSelect => "\\Noselect".to_owned(),
@@ -167,16 +156,16 @@ impl RealImap {
     /// Inner implementation of `list_messages` that accepts the envelope cache
     /// as a separate parameter, allowing the caller to satisfy the borrow
     /// checker by taking the cache out of `self` first.
-    async fn list_messages_inner(
+    fn list_messages_inner(
         &mut self,
         folder: &str,
         limit: usize,
         cache: &mut Option<EnvelopeCache>,
     ) -> Result<Vec<MessageHeader>, String> {
-        self.ensure_session().await?;
+        self.ensure_session()?;
         let session = self.session_mut();
 
-        let mailbox = session.select(folder).await.map_err(|e| e.to_string())?;
+        let mailbox = session.select(folder).map_err(|e| e.to_string())?;
         let total = mailbox.exists as usize;
         let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
@@ -188,12 +177,6 @@ impl RealImap {
         }
 
         // --- Cache logic ---
-        //
-        // `EnvelopeCache` wraps a `rusqlite::Connection`, which is `Send` but
-        // not `Sync`, so a shared borrow of it may not be held across an
-        // `.await` or the whole future stops being `Send` (and `#[async_trait]`
-        // requires `Send`). Decide what to do first, drop the borrow, then do
-        // the I/O.
         enum Plan {
             /// Cache already holds every message the server reports.
             ServeCached,
@@ -229,11 +212,9 @@ impl RealImap {
             }
             Plan::Incremental(max_uid) => {
                 let new_uid_range = format!("{}:*", max_uid + 1);
-                let stream = session
+                let fetched = session
                     .uid_fetch(&new_uid_range, "(UID ENVELOPE FLAGS)")
-                    .await
                     .map_err(|e| e.to_string())?;
-                let fetched: Vec<Fetch> = stream.try_collect().await.map_err(|e| e.to_string())?;
                 let new_headers: Vec<MessageHeader> =
                     fetched.iter().filter_map(parse_fetch_to_header).collect();
 
@@ -249,13 +230,8 @@ impl RealImap {
         // Full IMAP fetch (cache miss or no cache).
         let start = if total > limit { total - limit + 1 } else { 1 };
         let fetch_range = format!("{start}:{total}");
-        let stream = session
+        let fetched = session
             .fetch(&fetch_range, "(UID ENVELOPE FLAGS)")
-            .await
-            .map_err(|e| e.to_string())?;
-        let fetched: Vec<Fetch> = Box::pin(stream)
-            .try_collect()
-            .await
             .map_err(|e| e.to_string())?;
 
         let mut headers: Vec<MessageHeader> =
@@ -270,21 +246,19 @@ impl RealImap {
         Ok(headers)
     }
 
-    async fn fetch_message_inner(
+    fn fetch_message_inner(
         &mut self,
         folder: &str,
         uid: u32,
     ) -> Result<Option<EmailMessage>, String> {
-        self.ensure_session().await?;
+        self.ensure_session()?;
         let session = self.session_mut();
 
-        session.select(folder).await.map_err(|e| e.to_string())?;
+        session.select(folder).map_err(|e| e.to_string())?;
         let uid_str = uid.to_string();
-        let stream = session
+        let fetched = session
             .uid_fetch(&uid_str, "BODY[]")
-            .await
             .map_err(|e| e.to_string())?;
-        let fetched: Vec<Fetch> = stream.try_collect().await.map_err(|e| e.to_string())?;
 
         let raw = fetched
             .iter()
@@ -298,60 +272,46 @@ impl RealImap {
         }
     }
 
-    async fn fetch_by_message_id_inner(
+    fn fetch_by_message_id_inner(
         &mut self,
         folder: &str,
         message_id: &str,
     ) -> Result<Option<u32>, String> {
-        self.ensure_session().await?;
+        self.ensure_session()?;
         let session = self.session_mut();
 
-        session.select(folder).await.map_err(|e| e.to_string())?;
+        session.select(folder).map_err(|e| e.to_string())?;
         let search = format!("HEADER Message-ID {message_id}");
-        let uids = session
-            .uid_search(&search)
-            .await
-            .map_err(|e| e.to_string())?;
+        let uids = session.uid_search(&search).map_err(|e| e.to_string())?;
         Ok(uids.iter().next().copied())
     }
 
-    async fn set_flags_inner(
+    fn set_flags_inner(
         &mut self,
         folder: &str,
         uid: u32,
         add: &[&str],
         remove: &[&str],
     ) -> Result<(), String> {
-        self.ensure_session().await?;
+        self.ensure_session()?;
         let session = self.session_mut();
 
-        session.select(folder).await.map_err(|e| e.to_string())?;
+        session.select(folder).map_err(|e| e.to_string())?;
         let uid_str = uid.to_string();
         if !add.is_empty() {
             let query = format!("+FLAGS ({})", add.join(" "));
-            let stream = session
+            session
                 .uid_store(&uid_str, &query)
-                .await
-                .map_err(|e| e.to_string())?;
-            // The response stream has to be drained or the command never
-            // completes on the wire.
-            let _: Vec<Fetch> = Box::pin(stream)
-                .try_collect()
-                .await
                 .map_err(|e| e.to_string())?;
         }
         if !remove.is_empty() {
             let query = format!("-FLAGS ({})", remove.join(" "));
-            let stream = session
+            session
                 .uid_store(&uid_str, &query)
-                .await
-                .map_err(|e| e.to_string())?;
-            let _: Vec<Fetch> = Box::pin(stream)
-                .try_collect()
-                .await
                 .map_err(|e| e.to_string())?;
         }
         // Keep the envelope cache in sync.
+        self.open_cache();
         if let Some(ref cache) = self.cache {
             let new_seen = if add.contains(&"\\Seen") {
                 Some(true)
@@ -372,95 +332,67 @@ impl RealImap {
         Ok(())
     }
 
-    async fn copy_message_inner(
-        &mut self,
-        folder: &str,
-        uid: u32,
-        dest: &str,
-    ) -> Result<(), String> {
-        self.ensure_session().await?;
+    fn copy_message_inner(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        self.ensure_session()?;
         let session = self.session_mut();
-        session.select(folder).await.map_err(|e| e.to_string())?;
+        session.select(folder).map_err(|e| e.to_string())?;
         session
-            .uid_copy(&uid.to_string(), dest)
-            .await
+            .uid_copy(uid.to_string(), dest)
             .map_err(|e| e.to_string())
     }
 
-    async fn move_message_inner(
-        &mut self,
-        folder: &str,
-        uid: u32,
-        dest: &str,
-    ) -> Result<(), String> {
-        self.ensure_session().await?;
+    fn move_message_inner(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        self.ensure_session()?;
         let session = self.session_mut();
-        session.select(folder).await.map_err(|e| e.to_string())?;
+        session.select(folder).map_err(|e| e.to_string())?;
         let uid_str = uid.to_string();
 
         // Try MOVE extension (RFC 6851) first; fall back to COPY + \Deleted + EXPUNGE.
-        if session.uid_mv(&uid_str, dest).await.is_ok() {
+        if session.uid_mv(&uid_str, dest).is_ok() {
             return Ok(());
         }
         // Fallback ordering matters: a failed COPY must not leave the message
         // marked \Deleted, or it would be destroyed without arriving.
         session
             .uid_copy(&uid_str, dest)
-            .await
             .map_err(|e| e.to_string())?;
-        let stream = session
+        session
             .uid_store(&uid_str, "+FLAGS (\\Deleted)")
-            .await
             .map_err(|e| e.to_string())?;
-        let _: Vec<Fetch> = Box::pin(stream)
-            .try_collect()
-            .await
-            .map_err(|e| e.to_string())?;
-        let stream = session
-            .uid_expunge(&uid_str)
-            .await
-            .map_err(|e| e.to_string())?;
-        let _: Vec<u32> = Box::pin(stream)
-            .try_collect()
-            .await
-            .map_err(|e| e.to_string())?;
+        session.uid_expunge(&uid_str).map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    async fn expunge_uid_inner(&mut self, folder: &str, uid: u32) -> Result<(), String> {
-        self.ensure_session().await?;
+    fn expunge_uid_inner(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        self.ensure_session()?;
         let session = self.session_mut();
-        session.select(folder).await.map_err(|e| e.to_string())?;
-        let stream = session
-            .uid_expunge(&uid.to_string())
-            .await
-            .map_err(|e| e.to_string())?;
-        let _: Vec<u32> = Box::pin(stream)
-            .try_collect()
-            .await
+        session.select(folder).map_err(|e| e.to_string())?;
+        session
+            .uid_expunge(uid.to_string())
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    async fn append_inner(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
-        self.ensure_session().await?;
+    fn append_inner(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
+        self.ensure_session()?;
         let session = self.session_mut();
         session
-            .append(folder, None, None, message)
-            .await
+            .append(folder, message)
+            .finish()
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
     /// `fetch_threads` minus the error bookkeeping.
-    async fn threads_inner(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
+    fn threads_inner(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
         if self.thread_conn.is_none() {
-            self.thread_conn = Some(RawImap::connect(&self.config).await?);
+            self.thread_conn = Some(RawImap::connect(&self.config)?);
         }
         let raw = self.thread_conn.as_mut().expect("connected above");
 
         // Returns None (not an error) when the server cannot thread, so the
         // caller falls back to the per-Message-ID SEARCH path.
-        let caps = raw.capabilities().await?;
+        let caps = raw.capabilities()?;
         let algo = if caps.iter().any(|c| c == "THREAD=REFERENCES") {
             "REFERENCES"
         } else if caps.iter().any(|c| c == "THREAD=ORDEREDSUBJECT") {
@@ -469,99 +401,81 @@ impl RealImap {
             return Ok(None);
         };
 
-        let response = raw.uid_thread(folder, algo).await?;
+        let response = raw.uid_thread(folder, algo)?;
         Ok(Some(parse_thread_response(&response)))
     }
 }
 
-#[async_trait]
 impl ImapBackend for RealImap {
-    async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
-        timed!(self, self.list_folders_inner())
+    fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
+        self.guarded(|s| s.list_folders_inner())
     }
 
-    async fn list_messages(
-        &mut self,
-        folder: &str,
-        limit: usize,
-    ) -> Result<Vec<MessageHeader>, String> {
+    fn list_messages(&mut self, folder: &str, limit: usize) -> Result<Vec<MessageHeader>, String> {
         // Take the cache out of self so we can hold a session borrow at the
         // same time (the borrow checker can't prove they're disjoint fields).
+        self.open_cache();
         let mut cache = self.cache.take();
-        let result = timed!(self, self.list_messages_inner(folder, limit, &mut cache));
+        let result = self.guarded(|s| s.list_messages_inner(folder, limit, &mut cache));
         self.cache = cache;
         result
     }
 
-    async fn fetch_message(
-        &mut self,
-        folder: &str,
-        uid: u32,
-    ) -> Result<Option<EmailMessage>, String> {
-        timed!(self, self.fetch_message_inner(folder, uid))
+    fn fetch_message(&mut self, folder: &str, uid: u32) -> Result<Option<EmailMessage>, String> {
+        self.guarded(|s| s.fetch_message_inner(folder, uid))
     }
 
-    async fn fetch_message_by_message_id(
+    fn fetch_message_by_message_id(
         &mut self,
         folder: &str,
         message_id: &str,
     ) -> Result<Option<EmailMessage>, String> {
-        let uid = timed!(self, self.fetch_by_message_id_inner(folder, message_id))?;
+        let uid = self.guarded(|s| s.fetch_by_message_id_inner(folder, message_id))?;
         match uid {
             // Reuse the normal fetch path.
-            Some(uid) => self.fetch_message(folder, uid).await,
+            Some(uid) => self.fetch_message(folder, uid),
             None => Ok(None),
         }
     }
 
-    async fn set_flags(
+    fn set_flags(
         &mut self,
         folder: &str,
         uid: u32,
         add: &[&str],
         remove: &[&str],
     ) -> Result<(), String> {
-        timed!(self, self.set_flags_inner(folder, uid, add, remove))
+        self.guarded(|s| s.set_flags_inner(folder, uid, add, remove))
     }
 
-    async fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
-        timed!(self, self.copy_message_inner(folder, uid, dest))
+    fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        self.guarded(|s| s.copy_message_inner(folder, uid, dest))
     }
 
-    async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
-        timed!(self, self.move_message_inner(folder, uid, dest))
+    fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        self.guarded(|s| s.move_message_inner(folder, uid, dest))
     }
 
-    async fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
-        timed!(self, self.expunge_uid_inner(folder, uid))
+    fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        self.guarded(|s| s.expunge_uid_inner(folder, uid))
     }
 
-    async fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
-        timed!(self, self.append_inner(folder, message))
+    fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
+        self.guarded(|s| s.append_inner(folder, message))
     }
 
-    async fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
-        // Runs on a dedicated `RawImap` rather than the main session: neither
+    fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
+        // Runs on a dedicated `RawImap` rather than the main session: no
         // imap-proto release can decode a `* THREAD` response (see `RawImap`'s
         // docs), and keeping it off the main session also stops it from
         // changing which mailbox that session has selected.
-        let outcome = tokio::time::timeout(IMAP_TIMEOUT, self.threads_inner(folder)).await;
-        match outcome {
-            Ok(Ok(threads)) => Ok(threads),
-            Ok(Err(e)) => {
-                // Force a reconnect on the next call — a half-open connection
-                // would fail every subsequent fetch.
-                self.thread_conn = None;
-                Err(e)
-            }
-            Err(_) => {
-                self.thread_conn = None;
-                Err(format!(
-                    "IMAP server did not respond to THREAD within {}s",
-                    IMAP_TIMEOUT.as_secs()
-                ))
-            }
+        let outcome = self.threads_inner(folder);
+        if outcome.is_err() {
+            // Force a reconnect on the next call — a half-open connection
+            // would fail every subsequent fetch.
+            self.thread_conn = None;
         }
+        outcome
     }
 }
 
@@ -600,9 +514,8 @@ fn parse_smtp_url(url: &str) -> Option<(String, u16)> {
     }
 }
 
-#[async_trait]
 impl SmtpBackend for RealSmtp {
-    async fn send(
+    fn send(
         &mut self,
         from: &str,
         to: &[&str],
@@ -669,39 +582,152 @@ impl SmtpBackend for RealSmtp {
         };
 
         let raw = email.formatted();
+        let envelope = email.envelope();
+        let recipients: Vec<String> = envelope.to().iter().map(|a| a.to_string()).collect();
+        let sender = envelope
+            .from()
+            .map(|a| a.to_string())
+            .ok_or("the message has no sender")?;
 
-        let transport: AsyncSmtpTransport<Tokio1Executor> =
-            if self.config.oauth_access_token.is_empty() {
-                let creds =
-                    Credentials::new(self.config.username.clone(), self.config.password.clone());
-                AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-                    .map_err(|e| e.to_string())?
-                    .port(port)
-                    .credentials(creds)
-                    .build()
-            } else {
-                let creds = Credentials::new(
-                    self.config.username.clone(),
-                    self.config.oauth_access_token.clone(),
-                );
-                AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-                    .map_err(|e| e.to_string())?
-                    .port(port)
-                    .credentials(creds)
-                    .authentication(vec![Mechanism::Xoauth2])
-                    .build()
+        let mut smtp = Smtp::open(&self.config.smtp_url, &host, port)?;
+        let auth = if self.config.oauth_access_token.is_empty() {
+            let plain = format!("\0{}\0{}", self.config.username, self.config.password);
+            format!("AUTH PLAIN {}", b64(plain.as_bytes()))
+        } else {
+            let payload = crate::connection::xoauth2_payload(
+                &self.config.username,
+                &self.config.oauth_access_token,
+            );
+            format!("AUTH XOAUTH2 {}", b64(payload.as_bytes()))
+        };
+        smtp.command(&auth, &[235])?;
+        smtp.command(&format!("MAIL FROM:<{sender}>"), &[250])?;
+        for rcpt in &recipients {
+            smtp.command(&format!("RCPT TO:<{rcpt}>"), &[250, 251])?;
+        }
+        smtp.command("DATA", &[354])?;
+        smtp.write(&dot_stuff(&raw))?;
+        smtp.command(".", &[250])?;
+        // The message is accepted; a server that drops the connection before
+        // answering QUIT has not lost it.
+        let _ = smtp.command("QUIT", &[221]);
+        Ok(raw)
+    }
+}
+
+/// Base64, standard alphabet.
+fn b64(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+}
+
+/// The message body of `DATA`: every line that starts with `.` gets a second
+/// one (RFC 5321 4.5.2), and it ends with a line break so the lone `.` that
+/// closes it is on a line of its own.
+fn dot_stuff(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 16);
+    let mut at_line_start = true;
+    for &b in raw {
+        if at_line_start && b == b'.' {
+            out.push(b'.');
+        }
+        out.push(b);
+        at_line_start = b == b'\n';
+    }
+    if !out.ends_with(b"\r\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// One SMTP conversation, always encrypted before anything is sent: implicit
+/// TLS for `smtps://` (465), STARTTLS for `smtp://` (587).
+struct Smtp {
+    io: std::io::BufReader<crate::connection::ImapStream>,
+}
+
+impl Smtp {
+    /// Connect, read the greeting and say EHLO, upgrading a `smtp://`
+    /// connection with STARTTLS first. A server that will not upgrade gets
+    /// no credentials.
+    fn open(url: &str, host: &str, port: u16) -> Result<Self, String> {
+        use crate::connection::{ImapStream, open_tcp, open_tls, tls};
+        if url.starts_with("smtps://") {
+            let mut smtp = Smtp {
+                io: std::io::BufReader::new(open_tls(host, port)?),
             };
+            smtp.expect(&[220])?;
+            smtp.command("EHLO sicompass", &[250])?;
+            return Ok(smtp);
+        }
+        let mut plain = Smtp {
+            io: std::io::BufReader::new(ImapStream::Plain(open_tcp(host, port)?)),
+        };
+        plain.expect(&[220])?;
+        plain.command("EHLO sicompass", &[250])?;
+        plain.command("STARTTLS", &[220])?;
+        // Nothing follows the 220 until the handshake, so the reader holds
+        // nothing that would be lost here.
+        let ImapStream::Plain(tcp) = plain.io.into_inner() else {
+            unreachable!("opened in the clear above");
+        };
+        let mut smtp = Smtp {
+            io: std::io::BufReader::new(tls(host, tcp)?),
+        };
+        // The capabilities before the upgrade are not to be trusted.
+        smtp.command("EHLO sicompass", &[250])?;
+        Ok(smtp)
+    }
 
-        // Connect + TLS + auth + DATA used to run on the render thread with no
-        // bound at all.
-        let sent = tokio::time::timeout(IMAP_TIMEOUT, transport.send(email.clone())).await;
-        match sent {
-            Ok(Ok(_)) => Ok(raw),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err(format!(
-                "SMTP server did not respond within {}s",
-                IMAP_TIMEOUT.as_secs()
-            )),
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let s = self.io.get_mut();
+        s.write_all(bytes)
+            .and_then(|_| s.flush())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Send `line` and read the reply, which must carry one of `ok`.
+    fn command(&mut self, line: &str, ok: &[u16]) -> Result<String, String> {
+        self.write(format!("{line}\r\n").as_bytes())?;
+        self.expect(ok).map_err(|e| {
+            // Never echo credentials back in an error.
+            let verb = line
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let verb = if verb.starts_with("AUTH") {
+                "AUTH".to_owned()
+            } else {
+                verb
+            };
+            format!("SMTP {verb}: {e}")
+        })
+    }
+
+    /// Read one reply (all its continuation lines) and check its code.
+    fn expect(&mut self, ok: &[u16]) -> Result<String, String> {
+        use std::io::BufRead;
+        let mut text = String::new();
+        loop {
+            let mut line = String::new();
+            match self.io.read_line(&mut line) {
+                Ok(0) => return Err("the server closed the connection".to_owned()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            let line = line.trim_end();
+            text.push_str(line);
+            text.push('\n');
+            // `250-...` continues, `250 ...` (or a bare `250`) ends the reply.
+            if line.len() < 4 || line.as_bytes()[3] != b'-' {
+                let code: u16 = line.get(..3).and_then(|c| c.parse().ok()).unwrap_or(0);
+                return if ok.contains(&code) {
+                    Ok(text)
+                } else {
+                    Err(text.trim_end().to_owned())
+                };
+            }
         }
     }
 }
@@ -744,7 +770,7 @@ fn parse_rfc2822(uid: u32, raw: &[u8]) -> EmailMessage {
         let mut value = line.to_owned();
         while lines
             .peek()
-            .map_or(false, |l| l.starts_with(' ') || l.starts_with('\t'))
+            .is_some_and(|l| l.starts_with(' ') || l.starts_with('\t'))
         {
             if let Some(cont) = lines.next() {
                 value.push(' ');
@@ -830,16 +856,16 @@ fn parse_attachments(raw_body: &str, content_type: &str) -> Vec<EmailAttachment>
                 part_ct = line[14..].to_owned();
             } else if lc.starts_with("content-transfer-encoding: ") {
                 part_cte = line[27..].trim().to_ascii_lowercase();
-            } else if lc.starts_with("content-disposition: ") {
-                disposition = lc[21..].to_owned();
+            } else if let Some(rest) = lc.strip_prefix("content-disposition: ") {
+                disposition = rest.to_owned();
                 // Extract filename= from the same header line.
                 for param in line[21..].split(';') {
                     let p = param.trim();
                     let pl = p.to_ascii_lowercase();
                     if pl.starts_with("filename=") || pl.starts_with("filename*=") {
                         filename = p
-                            .splitn(2, '=')
-                            .nth(1)
+                            .split_once('=')
+                            .map(|x| x.1)
                             .unwrap_or("")
                             .trim_matches('"')
                             .to_owned();
@@ -906,24 +932,22 @@ fn parse_body_part(raw: &str, content_type: &str, cte: &str) -> MailBody {
             MailBody::Text(crate::flatten_ffon_to_text(&elems))
         }
         "application/json" => {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded) {
-                if sicompass_sdk::ffon::is_ffon(&v) {
-                    if let Ok(elems) = serde_json::from_value(v) {
-                        return MailBody::Ffon(elems);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded)
+                && sicompass_sdk::ffon::is_ffon(&v)
+                && let Ok(elems) = serde_json::from_value(v)
+            {
+                return MailBody::Ffon(elems);
             }
             MailBody::Text(decoded)
         }
         // text/plain or unknown/empty — treat as plain text, but promote to
         // Ffon if the content is valid FFON JSON (sicompass-sent bodies).
         _ => {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded) {
-                if sicompass_sdk::ffon::is_ffon(&v) {
-                    if let Ok(elems) = serde_json::from_value(v) {
-                        return MailBody::Ffon(elems);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded)
+                && sicompass_sdk::ffon::is_ffon(&v)
+                && let Ok(elems) = serde_json::from_value(v)
+            {
+                return MailBody::Ffon(elems);
             }
             MailBody::Text(decoded)
         }
@@ -1032,14 +1056,14 @@ fn parse_fetch_to_header(m: &Fetch) -> Option<MessageHeader> {
         .and_then(|b| std::str::from_utf8(b).ok())
         .unwrap_or("")
         .to_owned();
-    // `flags()` yields an iterator in async-imap, where the blocking crate
-    // returned a slice.
     let seen = m
         .flags()
-        .any(|f| matches!(f, async_imap::types::Flag::Seen));
+        .iter()
+        .any(|f| matches!(f, imap::types::Flag::Seen));
     let flagged = m
         .flags()
-        .any(|f| matches!(f, async_imap::types::Flag::Flagged));
+        .iter()
+        .any(|f| matches!(f, imap::types::Flag::Flagged));
     let message_id = env
         .message_id
         .as_deref()
@@ -1127,9 +1151,7 @@ pub(crate) fn parse_thread_response(response: &str) -> Vec<Vec<u32>> {
             }
             ')' => {
                 flush_num(&mut num_buf, &mut current);
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 if depth == 0 && !current.is_empty() {
                     threads.push(std::mem::take(&mut current));
                 }
@@ -1152,6 +1174,57 @@ pub(crate) fn parse_thread_response(response: &str) -> Vec<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smtp_without_starttls_never_sends_the_password() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut heard = Vec::new();
+            w.write_all(b"220 fake ESMTP\r\n").unwrap();
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap_or(0) > 0 {
+                heard.push(line.trim_end().to_owned());
+                let reply: &[u8] = if line.starts_with("EHLO") {
+                    b"250 fake\r\n"
+                } else if line.starts_with("STARTTLS") {
+                    b"454 TLS not available\r\n"
+                } else {
+                    b"250 ok\r\n"
+                };
+                if w.write_all(reply).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+            heard
+        });
+
+        let config = EmailClientConfig {
+            smtp_url: format!("smtp://127.0.0.1:{port}"),
+            username: "me@example.com".to_owned(),
+            password: "hunter2".to_owned(),
+            ..Default::default()
+        };
+        let err = RealSmtp::from_config(&config)
+            .send(
+                "me@example.com",
+                &["you@example.com"],
+                &[],
+                &[],
+                "hi",
+                &MailBody::Text("hello".to_owned()),
+                &[],
+            )
+            .expect_err("a server that cannot upgrade must not be used");
+        assert!(err.contains("STARTTLS"), "{err}");
+        let heard = server.join().unwrap();
+        assert_eq!(heard, ["EHLO sicompass", "STARTTLS"]);
+    }
 
     #[test]
     fn test_parse_smtp_url_with_port() {
@@ -1301,14 +1374,15 @@ mod tests {
         let imap_url = std::env::var("SICOMPASS_TEST_IMAP_URL").unwrap();
         let username = std::env::var("SICOMPASS_TEST_USERNAME").unwrap();
         let password = std::env::var("SICOMPASS_TEST_PASSWORD").unwrap();
-        let mut config = EmailClientConfig::default();
-        config.imap_url = imap_url;
-        config.username = username;
-        config.password = password;
+        let config = EmailClientConfig {
+            imap_url,
+            username,
+            password,
+            ..Default::default()
+        };
 
         let mut backend = RealImap::from_config(&config);
-        let folders =
-            crate::connection::block_on(backend.list_folders()).expect("list_folders failed");
+        let folders = backend.list_folders().expect("list_folders failed");
         assert!(!folders.is_empty(), "expected at least one folder");
         println!(
             "folders: {:?}",
@@ -1319,7 +1393,8 @@ mod tests {
             .iter()
             .find(|f| f.name.to_uppercase() == "INBOX")
             .expect("INBOX not found");
-        let headers = crate::connection::block_on(backend.list_messages(&inbox.name, 5))
+        let headers = backend
+            .list_messages(&inbox.name, 5)
             .expect("list_messages failed");
         println!("inbox headers: {headers:?}");
     }
