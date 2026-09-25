@@ -1,9 +1,9 @@
 {
-  # emailclient_plugin_sicompass: an IMAP and SMTP email client, a sicompass WASM plugin. The
+  # emailclient-plugin-sicompass: an IMAP and SMTP email client, a sicompass WASM plugin. The
   # plugin is built for wasm32-wasip2, which nixpkgs' rustc
   # has no std for, so the toolchain comes from rust-overlay (as in
   # sicompass-plugin-sdk's flake). flake.lock pins it.
-  description = "emailclient_plugin_sicompass: an IMAP and SMTP email client, a sicompass WASM plugin";
+  description = "emailclient-plugin-sicompass: an IMAP and SMTP email client, a sicompass WASM plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

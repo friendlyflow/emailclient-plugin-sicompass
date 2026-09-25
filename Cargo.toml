@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "IMAP and SMTP email for sicompass: folders, messages and a compose form as lists, as a WASM plugin"
-repository = "https://github.com/friendlyflow/emailclient_plugin_sicompass"
+repository = "https://github.com/friendlyflow/emailclient-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 

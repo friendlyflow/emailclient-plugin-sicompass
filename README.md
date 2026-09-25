@@ -1,4 +1,4 @@
-# emailclient_plugin_sicompass
+# emailclient-plugin-sicompass
 
 *Email, in Sicompass.*
 
