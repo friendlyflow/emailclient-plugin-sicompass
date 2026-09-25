@@ -34,11 +34,11 @@ jobs:
       - uses: cachix/install-nix-action@v31
 
       - name: Install the release tool
-        # The same tool the Store's checks come from, pinned to the SDK rev
+        # The same tool the Store's checks come from, pinned to the SDK release
         # this plugin builds against.
         run: |
           nix develop -c cargo install --git https://github.com/friendlyflow/sicompass-plugin-sdk \
-            --rev 494cff619feb408aff15f541ba530120a65019fa sicompass-plugin --root "$RUNNER_TEMP/tool"
+            --tag v0.9.0 sicompass-plugin --root "$RUNNER_TEMP/tool"
           echo "SICOMPASS_PLUGIN=$RUNNER_TEMP/tool/bin/sicompass-plugin" >> "$GITHUB_ENV"
 
       - name: Build, pack, sign, verify
