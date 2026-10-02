@@ -8003,3 +8003,59 @@ fn decode_op(entry: &ProviderOp) -> Option<ImapOpKind> {
         _ => return None,
     })
 }
+
+/// The tutorial's paragraphs about this plugin are the plugin's own:
+/// `emailclient-tutorial`, then `emailclient-tutorial-2` and so on. The tutorial reads them
+/// from the installed `locales/*.ftl`, so every language needs the same ones.
+#[cfg(test)]
+mod tutorial_text_tests {
+    const LOCALES: [(&str, &str); 4] = [
+        ("en-US", include_str!("../locales/en-US.ftl")),
+        ("nl-BE", include_str!("../locales/nl-BE.ftl")),
+        ("fr-BE", include_str!("../locales/fr-BE.ftl")),
+        ("de-BE", include_str!("../locales/de-BE.ftl")),
+    ];
+
+    /// The plugin's name, kept apart from the `-tutorial` suffix so no
+    /// half-built id appears quoted in the source.
+    const NAME: &str = "emailclient";
+
+    fn tutorial_id(line: &str) -> Option<&str> {
+        let id = line.split_once(" = ")?.0;
+        let base = format!("{NAME}-tutorial");
+        (id == base || id.starts_with(&format!("{base}-"))).then_some(id)
+    }
+
+    fn tutorial_ids(ftl: &str) -> Vec<&str> {
+        ftl.lines().filter_map(tutorial_id).collect()
+    }
+
+    fn tutorial_text(ftl: &str) -> String {
+        ftl.lines()
+            .filter(|l| tutorial_id(l).is_some())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_language_has_the_same_tutorial_leaves() {
+        let en = tutorial_ids(LOCALES[0].1);
+        assert_eq!(en, ["emailclient-tutorial", "emailclient-tutorial-2"], "en-US's tutorial leaves");
+        for (locale, ftl) in &LOCALES[1..] {
+            assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
+        }
+    }
+
+    #[test]
+    fn the_tutorial_documents_gmail_setup() {
+        let text = tutorial_text(LOCALES[0].1);
+        // The Gmail setup leaf must call out the mail scope (the actual fix) and
+        // the recovery colon commands.
+        assert!(
+            text.contains("https://mail.google.com/"),
+            "must name the mail scope, got:\n{text}"
+        );
+        assert!(text.contains(":refresh"), "must mention the :refresh colon command");
+        assert!(text.contains(":logout"), "must mention re-authorizing via :logout");
+    }
+}
