@@ -1,8 +1,8 @@
 //! The email client's background work: one worker that owns the IMAP session
 //! and the SMTP connection, and runs what the UI asks of it in order.
 //!
-//! A call from the app gets 10 seconds, and an IMAP folder listing or an SMTP
-//! send can take longer, so none of it runs there. The UI side sends a
+//! The app waits for every call to answer, and an IMAP folder listing or an
+//! SMTP send can take a while, so none of it runs there. The UI side sends a
 //! [`Job`]; the worker does it with no deadline and answers with a [`Done`],
 //! which `poll` applies to the same result slots the rendering code reads.
 //! The worker is a thread that lives as long as the plugin, fed through a

@@ -29,9 +29,9 @@ GitHub releases, one build per platform. The plugin platform is described in
 
 ## How it works
 
-Every call from the app has a 10-second deadline, after which the app ends the
-plugin, and an IMAP round trip can take longer, so the mail servers are never
-contacted on a call:
+The app waits for every call to answer, drawing nothing meanwhile, and an IMAP
+round trip can take a while, so the mail servers are never contacted on a
+call:
 
 - **The worker** (`worker.rs`) is one thread for the plugin's life, holding the
   one IMAP connection. The UI side sends it `Job`s over a channel and it

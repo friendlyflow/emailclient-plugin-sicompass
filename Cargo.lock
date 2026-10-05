@@ -227,7 +227,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -832,7 +832,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -977,7 +977,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sicompass-sdk"
 version = "0.9.1"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=60dfd27f7c0949ea8d22fe41d0a331c38ed65ae3#60dfd27f7c0949ea8d22fe41d0a331c38ed65ae3"
+source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=06a9037b5a1194be87af786bdfde928be173473e#06a9037b5a1194be87af786bdfde928be173473e"
 dependencies = [
  "async-trait",
  "libc",
@@ -1087,7 +1087,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

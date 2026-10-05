@@ -20,9 +20,9 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// How long one request may take, start to end. A token refresh before a
-/// send runs on a call from the app, which gives up on a call after 10
-/// seconds and ends the plugin, so a slow answer must fail before that.
-const TIMEOUT: Duration = Duration::from_secs(8);
+/// send runs on a call from the app, which waits for it, so a server that
+/// hangs becomes an error.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most a response may hold. Google's token and userinfo answers are a
 /// few hundred bytes.

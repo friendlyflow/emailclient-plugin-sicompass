@@ -56,4 +56,4 @@ codegen-units = 1
 # TEMPORARY, until sicompass-sdk 0.9.1 is on crates.io: the SDK commit with the
 # plugin kit (`plugin` feature), by git rev. Remove this section at the release.
 [patch.crates-io]
-sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "60dfd27f7c0949ea8d22fe41d0a331c38ed65ae3" }
+sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "06a9037b5a1194be87af786bdfde928be173473e" }
