@@ -53,7 +53,5 @@ codegen-units = 1
 # again before committing. With it live, a green build proves nothing about what
 # the published crates resolve to.
 #
-# TEMPORARY, until sicompass-sdk 0.9.1 is on crates.io: the SDK commit with the
-# plugin kit (`plugin` feature), by git rev. Remove this section at the release.
-[patch.crates-io]
-sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "06a9037b5a1194be87af786bdfde928be173473e" }
+# [patch.crates-io]
+# sicompass-sdk = { path = "../sicompass-plugin-sdk" }

@@ -977,7 +977,8 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sicompass-sdk"
 version = "0.9.1"
-source = "git+https://github.com/friendlyflow/sicompass-plugin-sdk?rev=06a9037b5a1194be87af786bdfde928be173473e#06a9037b5a1194be87af786bdfde928be173473e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87268b7bdc44757a5612bb692d9771ae7d60787ebfedbe969895c8a8329fd00b"
 dependencies = [
  "async-trait",
  "libc",
