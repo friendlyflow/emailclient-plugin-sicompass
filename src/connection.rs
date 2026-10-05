@@ -1,12 +1,10 @@
 //! Shared IMAP connection helpers used by both `net.rs` (RealImap) and
 //! `idle.rs` (the IDLE watcher).
 //!
-//! Blocking, over TLS: rustls with ring and the webpki roots, so the same code
-//! runs natively and in the sandbox. In the sandbox the TCP connection comes
-//! from the host (`sicompass_pdk::sockets`), which reaches only public servers
-//! on the ports `plugin.json` lists. Every read and write is bounded by
-//! [`IO_TIMEOUT`], so a server that goes silent fails the exchange instead of
-//! holding it forever.
+//! Blocking, over TLS: rustls with ring and the webpki roots, on a plain
+//! `std::net::TcpStream`. `plugin.json` declares the ports it uses (`sockets`).
+//! Connecting and every read and write are bounded by [`IO_TIMEOUT`], so a
+//! server that goes silent fails the exchange instead of holding it forever.
 
 use crate::EmailClientConfig;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -142,16 +140,8 @@ pub fn xoauth2_payload(user: &str, token: &str) -> String {
 // Connecting
 // ---------------------------------------------------------------------------
 
-/// The addresses of `host:port`: through the host in the sandbox, which
-/// answers only for public servers on the ports `plugin.json` lists.
+/// The addresses of `host:port`, from the system's resolver.
 fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
-    #[cfg(target_arch = "wasm32")]
-    let addrs: Vec<SocketAddr> = sicompass_pdk::sockets::resolve(host, port)?
-        .iter()
-        .filter_map(|a| a.parse::<std::net::IpAddr>().ok())
-        .map(|ip| SocketAddr::new(ip, port))
-        .collect();
-    #[cfg(not(target_arch = "wasm32"))]
     let addrs: Vec<SocketAddr> = {
         use std::net::ToSocketAddrs;
         (host, port)
@@ -170,11 +160,7 @@ fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
 fn connect(addrs: &[SocketAddr]) -> Result<TcpStream, String> {
     let mut last = String::from("no address");
     for addr in addrs {
-        #[cfg(target_arch = "wasm32")]
-        let attempt = TcpStream::connect(addr);
-        #[cfg(not(target_arch = "wasm32"))]
-        let attempt = TcpStream::connect_timeout(addr, IO_TIMEOUT);
-        match attempt {
+        match TcpStream::connect_timeout(addr, IO_TIMEOUT) {
             Ok(tcp) => {
                 // Best effort: a stream that cannot take a timeout still works.
                 let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));

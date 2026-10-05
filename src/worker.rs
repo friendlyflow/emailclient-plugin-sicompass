@@ -1,13 +1,12 @@
 //! The email client's background work: one worker that owns the IMAP session
 //! and the SMTP connection, and runs what the UI asks of it in order.
 //!
-//! A call into the plugin's UI instance gets 10 seconds, and an IMAP folder
-//! listing or an SMTP send can take longer, so none of it runs there. The UI
-//! sends a [`Job`]; the worker does it with no deadline and answers with a
-//! [`Done`], which the UI applies to the same result slots the rendering code
-//! reads. In the sandbox the worker is a task that lives as long as the
-//! plugin ([`WORKER_TASK`]), fed through the task inbox; natively it is a
-//! thread fed through a channel. Both carry the same serialized jobs.
+//! A call from the app gets 10 seconds, and an IMAP folder listing or an SMTP
+//! send can take longer, so none of it runs there. The UI side sends a
+//! [`Job`]; the worker does it with no deadline and answers with a [`Done`],
+//! which `poll` applies to the same result slots the rendering code reads.
+//! The worker is a thread that lives as long as the plugin, fed through a
+//! channel.
 
 use crate::net::{RealImap, RealSmtp};
 use crate::{
@@ -15,10 +14,6 @@ use crate::{
     SmtpBackend,
 };
 use serde::{Deserialize, Serialize};
-
-/// The long-lived task in the sandbox.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub const WORKER_TASK: &str = "worker";
 
 /// A write the UI already applied locally and the server still has to see.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,35 +295,18 @@ impl WorkerState {
     }
 }
 
-/// The settings as JSON, for a task's input.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn config_to_json(config: &EmailClientConfig) -> serde_json::Value {
-    serde_json::to_value(config).unwrap_or_default()
-}
-
-/// The inverse of [`config_to_json`].
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn config_from_json(value: &serde_json::Value) -> EmailClientConfig {
-    serde_json::from_value(value.clone()).unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // The UI's handle on the worker
 // ---------------------------------------------------------------------------
 
-/// The UI instance's side of the worker.
+/// The UI side of the worker.
 pub struct Worker {
-    #[cfg(not(target_arch = "wasm32"))]
     jobs: std::sync::mpsc::Sender<Vec<u8>>,
-    #[cfg(not(target_arch = "wasm32"))]
     done: std::sync::mpsc::Receiver<Vec<u8>>,
-    #[cfg(target_arch = "wasm32")]
-    task: u64,
 }
 
 impl Worker {
     /// Start the worker with `config`.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn start(config: &EmailClientConfig) -> Result<Worker, String> {
         let (jobs, job_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (done_tx, done) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -349,63 +327,30 @@ impl Worker {
         Ok(Worker { jobs, done })
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn start(config: &EmailClientConfig) -> Result<Worker, String> {
-        let input = config_to_json(config).to_string();
-        let task = sicompass_pdk::tasks::spawn(WORKER_TASK, input.as_bytes())?;
-        Ok(Worker { task })
-    }
-
     /// Hand the worker a job.
     pub fn send(&self, job: &Job) -> Result<(), String> {
         let bytes = serde_json::to_vec(job).map_err(|e| e.to_string())?;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.jobs
-                .send(bytes)
-                .map_err(|_| "the email worker has stopped".to_owned())
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            sicompass_pdk::tasks::send(self.task, &bytes)
-        }
+        self.jobs
+            .send(bytes)
+            .map_err(|_| "the email worker has stopped".to_owned())
     }
 
-    /// What the worker has finished since the last call (natively; in the
-    /// sandbox answers arrive through [`Worker::on_task_event`]).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn drain(&self) -> Vec<Done> {
-        self.done
-            .try_iter()
-            .filter_map(|b| serde_json::from_slice(&b).ok())
-            .collect()
-    }
-
-    /// An event from the worker task: its answer, if it is one of its.
-    /// `Err` when the task ended, so the UI starts a new one.
-    #[cfg(target_arch = "wasm32")]
-    pub fn on_task_event(
-        &self,
-        id: u64,
-        event: &sicompass_pdk::TaskEvent,
-    ) -> Option<Result<Done, String>> {
-        if id != self.task {
-            return None;
+    /// What the worker has finished since the last call. `Err` once its
+    /// thread has ended (a panic in a job), after the answers it gave before
+    /// that: whatever it still had to do is not coming, so the UI starts
+    /// another for the next job.
+    pub fn drain(&self) -> Result<Vec<Done>, (Vec<Done>, String)> {
+        use std::sync::mpsc::TryRecvError;
+        let mut done = Vec::new();
+        loop {
+            match self.done.try_recv() {
+                Ok(bytes) => done.extend(serde_json::from_slice(&bytes).ok()),
+                Err(TryRecvError::Empty) => return Ok(done),
+                Err(TryRecvError::Disconnected) => {
+                    return Err((done, "the email worker stopped".to_owned()));
+                }
+            }
         }
-        match event {
-            sicompass_pdk::TaskEvent::Progress(b) => serde_json::from_slice(b).ok().map(Ok),
-            sicompass_pdk::TaskEvent::Done(r) => Some(Err(match r {
-                Ok(_) => "the email worker ended".to_owned(),
-                Err(e) => format!("the email worker stopped: {e}"),
-            })),
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for Worker {
-    fn drop(&mut self) {
-        sicompass_pdk::tasks::cancel(self.task);
     }
 }
 
@@ -416,24 +361,7 @@ fn serve(state: &mut WorkerState, bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&done).ok()
 }
 
-/// The worker task itself, in the sandbox: jobs from the inbox, answers
-/// emitted, until the plugin goes away.
-#[cfg(target_arch = "wasm32")]
-pub fn run_worker_task(input: &[u8]) -> Result<Vec<u8>, String> {
-    use sicompass_pdk::tasks;
-    let config: serde_json::Value = serde_json::from_slice(input).map_err(|e| e.to_string())?;
-    let mut state = WorkerState::new(config_from_json(&config));
-    while !tasks::cancelled() {
-        if let Some(job) = tasks::receive(1000)
-            && let Some(answer) = serve(&mut state, &job)
-        {
-            tasks::emit(&answer);
-        }
-    }
-    Ok(Vec::new())
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -503,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn the_native_worker_answers_through_its_channel() {
+    fn the_worker_answers_through_its_channel() {
         let w = Worker::start(&EmailClientConfig::default()).unwrap();
         w.send(&Job::Threads {
             folder: "INBOX".into(),
@@ -511,7 +439,7 @@ mod tests {
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Some(Done::Threads { folder, threads }) = w.drain().into_iter().next() {
+            if let Some(Done::Threads { folder, threads }) = w.drain().unwrap().into_iter().next() {
                 assert_eq!(folder, "INBOX");
                 assert!(threads.is_none());
                 break;
@@ -519,5 +447,25 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no answer");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// A worker whose thread has gone says so once its answers are read, so
+    /// nothing waits on the jobs it still had.
+    #[test]
+    fn a_worker_whose_thread_ended_says_so_after_its_answers() {
+        let (jobs, _job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let w = Worker { jobs, done };
+        let answer = Done::Op {
+            label: "move failed".into(),
+            error: None,
+        };
+        done_tx.send(serde_json::to_vec(&answer).unwrap()).unwrap();
+        assert_eq!(w.drain().unwrap().len(), 1, "alive, one answer");
+        done_tx.send(serde_json::to_vec(&answer).unwrap()).unwrap();
+        drop(done_tx);
+        let (answers, error) = w.drain().unwrap_err();
+        assert_eq!(answers.len(), 1, "the answer before the end still counts");
+        assert!(error.contains("stopped"), "{error}");
     }
 }

@@ -14,9 +14,9 @@ Sign in with Google on the first screen, after setting a client ID and client
 secret in Settings, under email client. New mail arrives in the background.
 
 The email client asks to reach any mail server on the internet, on the ports
-mail uses (993, 465 and 587), because your mail server is yours to choose. It
-never reaches your own computer or local network. The Store shows that before
-you install it, and installing it is your approval.
+mail uses (993, 465 and 587), because your mail server is yours to choose.
+The Store shows that before you install it, and installing it is your
+approval.
 
 ## Install
 
@@ -27,21 +27,26 @@ and keeps it up to date.
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # natively, against a fake IMAP server
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/emailclient_plugin.wasm plugin.wasm
+nix develop          # the toolchain
+cargo test           # against a fake IMAP server
+cargo build --release
+cp target/release/emailclient-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+To install a build of your own, copy `plugin.json`, the built `plugin` program
+(`plugin.exe` on Windows) and `locales/` into a folder named `emailclient` in
+the Sicompass plugins folder (`~/.config/sicompass/plugins/` on Linux,
+`~/Library/Application Support/sicompass/plugins/` on macOS) and restart
+Sicompass.
+
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the WASM plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud backup library
 
 ## Community
 

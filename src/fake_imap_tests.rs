@@ -9,7 +9,7 @@
 //!
 //! They were written against the `imap` 2.x backend and passed unchanged
 //! through the `async-imap` migration and back to the blocking `imap` 3 the
-//! WASM plugin uses: they are the behaviour preservation proof for each port.
+//! plugin uses: they are the behaviour preservation proof for each port.
 //!
 //! The server speaks just enough IMAP to drive `RealImap`: it is a scripted
 //! responder, not a real mailbox. It listens on `127.0.0.1:0` and is reached
@@ -44,16 +44,16 @@ use base64::Engine as _;
 // Test isolation
 // ---------------------------------------------------------------------------
 
-/// Point the SQLite envelope cache at a scratch directory.
+/// Point the envelope cache at a scratch directory.
 ///
-/// Natively `EnvelopeCache::open` puts its DB under `$XDG_CACHE_HOME` (or
-/// `~/.cache`) on every platform. Without this the tests would read and write
-/// the developer's real email cache, and results would depend on previous
-/// runs: a warm cache lets `list_messages` answer from SQLite without issuing
-/// the FETCH the tests assert on, so a suite that passed on a clean machine
-/// failed on the second run.
+/// Outside sicompass (no storage folder) `EnvelopeCache::open` puts its file
+/// under `$XDG_CACHE_HOME` (or `~/.cache`) on every platform. Without this
+/// the tests would read and write the developer's real email cache, and
+/// results would depend on previous runs: a warm cache lets `list_messages`
+/// answer from the cache without issuing the FETCH the tests assert on, so a
+/// suite that passed on a clean machine failed on the second run.
 ///
-/// The DB file is keyed on the username, so each test additionally uses a
+/// The cache file is keyed on the username, so each test additionally uses a
 /// unique one (see [`unique_user`]) and therefore its own cache file.
 fn isolate_cache() {
     static ONCE: Once = Once::new();

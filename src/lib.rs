@@ -1,10 +1,11 @@
-//! Email client, a sicompass WASM plugin — Rust port of `lib_emailclient/`.
+//! Email client, a sicompass plugin — Rust port of `lib_emailclient/`.
 //!
-//! Implements the pdk's `Plugin` for IMAP/SMTP email access.
+//! A program sicompass starts (`src/main.rs`), with the user's rights. It
+//! implements the plugin kit's `Plugin` for IMAP/SMTP email access.
 //! IMAP and SMTP operations are injected via the [`ImapBackend`] and
 //! [`SmtpBackend`] traits, making the provider fully unit-testable.
 //! Real network backends live in `net`, OAuth2 in `oauth2`, IDLE in `idle`,
-//! and the background task that runs them in the sandbox in `worker`.
+//! and the background thread that runs them in `worker`.
 //!
 //! ## FFON tree layout
 //!
@@ -46,8 +47,8 @@
 
 pub mod cache;
 pub mod connection;
-// The wire tests against a fake IMAP server. In the crate rather than in
-// `tests/`, which could not link a cdylib.
+// The wire tests against a fake IMAP server, in the crate so they reach its
+// private parts.
 #[cfg(test)]
 mod fake_imap_tests;
 mod files;
@@ -61,9 +62,9 @@ mod worker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sicompass_pdk::{Descriptor, Plugin, PollResult, ProviderOp, export_plugin};
 use sicompass_sdk::ffon::{FfonElement, FfonObject};
 use sicompass_sdk::placeholders::{I_PLACEHOLDER, new_obj_with_i_placeholder, seed_i_placeholders};
+use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult, ProviderOp};
 use sicompass_sdk::provider::{ListItem, SearchResultItem};
 use sicompass_sdk::timeline::ImapOpKind;
 
@@ -817,16 +818,40 @@ impl EmailClientProvider {
         self.bg_completed.store(true, Ordering::Release);
     }
 
-    /// Apply what the native worker finished (in the sandbox answers come
-    /// through `on_task_event`).
+    /// Apply what the worker finished, and notice a worker that has ended.
     fn drain_worker(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let done = self.worker.as_ref().map(|w| w.drain()).unwrap_or_default();
-            for d in done {
-                self.apply_done(d);
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        match worker.drain() {
+            Ok(done) => {
+                for d in done {
+                    self.apply_done(d);
+                }
+            }
+            Err((done, e)) => {
+                for d in done {
+                    self.apply_done(d);
+                }
+                self.worker_ended(e);
             }
         }
+    }
+
+    /// The worker is gone; the next job starts another. Whatever it had in
+    /// flight is not coming, so nothing may wait on it.
+    fn worker_ended(&mut self, error: String) {
+        self.worker = None;
+        self.folder_fetch_inflight.store(false, Ordering::Release);
+        self.message_fetch_inflight.store(false, Ordering::Release);
+        self.send_inflight.store(false, Ordering::Release);
+        self.token_refresh_inflight.store(false, Ordering::Release);
+        self.message_fetch_key = None;
+        self.envelope_fetch_key = None;
+        self.thread_fetch_key = None;
+        self.history_fetch_key = None;
+        self.bg_errors.lock().unwrap().push(error);
+        self.bg_completed.store(true, Ordering::Release);
     }
 
     /// Drop the background connection so the next operation reconnects.
@@ -1440,14 +1465,11 @@ impl EmailClientProvider {
         }
         // Always sync username from the token so the XOAUTH2 `user=` field
         // matches the authenticated account, even when a username was previously set.
-        // The sign-in task has asked already; the native flow asks here.
-        let email = if result.email.is_empty() {
-            oauth2::fetch_email(&self.config.oauth_access_token)
-        } else {
-            Some(result.email)
-        };
-        if let Some(email) = email {
-            self.config.username = email;
+        // The sign-in thread asked Google for it already. If that failed the
+        // username stays: asking again here would be a request on a call
+        // from the app.
+        if !result.email.is_empty() {
+            self.config.username = result.email;
         }
         self.save_server_config();
         self.imap = None;
@@ -2998,8 +3020,7 @@ impl EmailClientProvider {
         self.envelope_cache = None;
         self.envelope_cache_folder.clear();
 
-        // The settings `plugin.json` declares, from the host.
-        #[cfg(target_arch = "wasm32")]
+        // The settings `plugin.json` declares, from the app.
         for key in [
             "emailImapUrl",
             "emailSmtpUrl",
@@ -3008,7 +3029,7 @@ impl EmailClientProvider {
             "emailClientId",
             "emailClientSecret",
         ] {
-            if let Some(v) = sicompass_pdk::host::get_setting(key)
+            if let Some(v) = sicompass_sdk::plugin::host::get_setting(key)
                 && !v.is_empty()
             {
                 self.apply_setting(key, &v);
@@ -4636,6 +4657,54 @@ mod tests {
             .label(),
             "save failed"
         );
+    }
+
+    /// A worker thread that ended (a panic in a job) answers nothing more,
+    /// so every slot waiting on it is released and the user is told.
+    #[test]
+    fn a_worker_that_ended_releases_everything_waiting_on_it() {
+        let mut p = EmailClientProvider::new();
+        p.folder_fetch_inflight.store(true, Ordering::Release);
+        p.message_fetch_inflight.store(true, Ordering::Release);
+        p.send_inflight.store(true, Ordering::Release);
+        p.token_refresh_inflight.store(true, Ordering::Release);
+        p.message_fetch_key = Some(("INBOX".to_owned(), 7));
+        p.envelope_fetch_key = Some(("INBOX".to_owned(), 50));
+        p.thread_fetch_key = Some("INBOX".to_owned());
+        p.history_fetch_key = Some("key".to_owned());
+
+        p.worker_ended("the email worker stopped".to_owned());
+
+        assert!(p.worker.is_none());
+        assert!(!p.folder_fetch_inflight.load(Ordering::Acquire));
+        assert!(!p.message_fetch_inflight.load(Ordering::Acquire));
+        assert!(!p.send_inflight.load(Ordering::Acquire));
+        assert!(!p.token_refresh_inflight.load(Ordering::Acquire));
+        assert!(p.message_fetch_key.is_none() && p.envelope_fetch_key.is_none());
+        assert!(p.thread_fetch_key.is_none() && p.history_fetch_key.is_none());
+        assert!(
+            p.bg_completed.load(Ordering::Acquire),
+            "a redraw is asked for"
+        );
+        assert_eq!(p.take_error().as_deref(), Some("the email worker stopped"));
+    }
+
+    /// The sign-in thread asks Google for the address, and the login takes it
+    /// as the IMAP username.
+    #[test]
+    fn finish_login_takes_the_address_the_sign_in_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = EmailClientProvider::new().with_config_path(dir.path().join("settings.json"));
+        p.config.username = "old@example.com".to_owned();
+        p.finish_login(crate::oauth2::OAuth2TokenResult {
+            success: true,
+            access_token: "new_token".to_owned(),
+            refresh_token: "new_refresh".to_owned(),
+            expires_in: 3600,
+            email: "me@gmail.com".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(p.config.username, "me@gmail.com");
     }
 
     #[test]
@@ -7770,10 +7839,10 @@ impl Plugin for EmailClientProvider {
         }
     }
 
-    fn command_list_items(&self, cmd: &str) -> Vec<sicompass_pdk::ListItem> {
+    fn command_list_items(&self, cmd: &str) -> Vec<sicompass_sdk::plugin::ListItem> {
         EmailClientProvider::command_list_items(self, cmd)
             .into_iter()
-            .map(|i| sicompass_pdk::ListItem {
+            .map(|i| sicompass_sdk::plugin::ListItem {
                 label: i.label,
                 data: i.data,
             })
@@ -7804,11 +7873,11 @@ impl Plugin for EmailClientProvider {
         if error.is_empty() { Ok(()) } else { Err(error) }
     }
 
-    fn collect_extended_search_items(&self) -> Option<Vec<sicompass_pdk::SearchResult>> {
+    fn collect_extended_search_items(&self) -> Option<Vec<sicompass_sdk::plugin::SearchResult>> {
         EmailClientProvider::collect_extended_search_items(self).map(|items| {
             items
                 .into_iter()
-                .map(|i| sicompass_pdk::SearchResult {
+                .map(|i| sicompass_sdk::plugin::SearchResult {
                     label: i.label,
                     breadcrumb: i.breadcrumb,
                     nav_path: i.nav_path,
@@ -7828,70 +7897,15 @@ impl Plugin for EmailClientProvider {
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
         EmailClientProvider::sync_ffon_body_children(self, children);
     }
-
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        match name {
-            #[cfg(target_arch = "wasm32")]
-            worker::WORKER_TASK => worker::run_worker_task(input),
-            #[cfg(target_arch = "wasm32")]
-            idle::IDLE_TASK => idle::run_idle_task(input),
-            #[cfg(target_arch = "wasm32")]
-            oauth2::OAUTH_TASK => oauth2::run_oauth_task(input),
-            other => {
-                let _ = input;
-                Err(format!("emailclient has no task named `{other}`"))
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
-        if self.idle.on_task_event(id, &event) {
-            return;
-        }
-        if let Some(login) = &self.active_login
-            && login.on_task_event(id, &event)
-        {
-            return;
-        }
-        let answer = self
-            .worker
-            .as_ref()
-            .and_then(|w| w.on_task_event(id, &event));
-        match answer {
-            Some(Ok(done)) => self.apply_done(done),
-            Some(Err(e)) => {
-                // The worker is gone; the next job starts another. Whatever it
-                // had in flight is not coming, so nothing may wait on it.
-                self.worker = None;
-                self.folder_fetch_inflight.store(false, Ordering::Release);
-                self.message_fetch_inflight.store(false, Ordering::Release);
-                self.send_inflight.store(false, Ordering::Release);
-                self.token_refresh_inflight.store(false, Ordering::Release);
-                self.message_fetch_key = None;
-                self.envelope_fetch_key = None;
-                self.thread_fetch_key = None;
-                self.history_fetch_key = None;
-                self.bg_errors.lock().unwrap().push(e);
-                self.bg_completed.store(true, Ordering::Release);
-            }
-            None => {}
-        }
-    }
 }
-
-export_plugin!(EmailClientProvider);
 
 /// Where the sign-in (the OAuth tokens, and the servers and address it filled
 /// in) is kept: the plugin's storage folder (`permissions.storage`), in the
-/// shape of a settings file with one `email client` section. Natively (the
-/// tests) nowhere unless a test names one.
+/// shape of a settings file with one `email client` section. Outside
+/// sicompass (the tests) there is no storage folder, so nowhere unless a test
+/// names one.
 fn default_state_path() -> Option<std::path::PathBuf> {
-    if cfg!(target_arch = "wasm32") {
-        Some(std::path::PathBuf::from(sicompass_pdk::STORAGE_DIR).join("email.json"))
-    } else {
-        None
-    }
+    sicompass_sdk::plugin::storage_dir().map(|dir| dir.join("email.json"))
 }
 
 /// A recorded action as the provider op the app keeps on its timeline: the
@@ -7955,14 +7969,14 @@ fn encode_op(op: &ImapOpKind) -> ProviderOp {
     }
     ProviderOp {
         command: command.to_owned(),
-        payload: sicompass_pdk::encode_one(&payload),
+        payload: sicompass_sdk::plugin::encode_one(&payload),
         label: label.to_owned(),
     }
 }
 
 /// The action a provider op records, if it is one of ours.
 fn decode_op(entry: &ProviderOp) -> Option<ImapOpKind> {
-    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let payload = sicompass_sdk::plugin::decode_one(&entry.payload)?;
     let parts: Vec<String> = payload
         .as_obj()?
         .children
@@ -8040,7 +8054,11 @@ mod tutorial_text_tests {
     #[test]
     fn every_language_has_the_same_tutorial_leaves() {
         let en = tutorial_ids(LOCALES[0].1);
-        assert_eq!(en, ["emailclient-tutorial", "emailclient-tutorial-2"], "en-US's tutorial leaves");
+        assert_eq!(
+            en,
+            ["emailclient-tutorial", "emailclient-tutorial-2"],
+            "en-US's tutorial leaves"
+        );
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }
@@ -8055,7 +8073,13 @@ mod tutorial_text_tests {
             text.contains("https://mail.google.com/"),
             "must name the mail scope, got:\n{text}"
         );
-        assert!(text.contains(":refresh"), "must mention the :refresh colon command");
-        assert!(text.contains(":logout"), "must mention re-authorizing via :logout");
+        assert!(
+            text.contains(":refresh"),
+            "must mention the :refresh colon command"
+        );
+        assert!(
+            text.contains(":logout"),
+            "must mention re-authorizing via :logout"
+        );
     }
 }

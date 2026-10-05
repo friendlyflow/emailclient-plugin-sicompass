@@ -4,14 +4,12 @@
 //! EXISTS, EXPUNGE or VANISHED, the provider's `notify` flag is raised so it
 //! refreshes on the next render.
 //!
-//! Blocking: IDLE waits in rounds of [`IDLE_ROUND`], and between rounds it
-//! looks whether it has been stopped, so a stop takes effect within a round
-//! without anything waiting on it. Natively the watcher is a thread. In the
-//! sandbox it is one long-lived task ([`IDLE_TASK`]) for the plugin's life:
-//! a task blocked in a socket read only notices a cancel when the read
-//! returns, so tasks started per folder would pile up against the host's cap
-//! on concurrent tasks. What to watch, a stop and a refreshed OAuth token
-//! reach it through its inbox ([`Command`]), and it emits [`CHANGED`].
+//! Blocking, on a thread of its own per watch: IDLE waits in rounds of
+//! [`IDLE_ROUND`], and between rounds it looks whether it has been stopped,
+//! so a stop takes effect within a round without anything waiting on it. A
+//! watcher told to stop while it is blocked ends at the end of its round,
+//! so switching folders leaves at most one old watcher finishing its round.
+//! A refreshed OAuth token reaches the running watcher through a shared slot.
 
 use crate::EmailClientConfig;
 use crate::connection::connect_imap;
@@ -27,28 +25,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 /// noticed soon: RFC 2177 only asks that IDLE be re-issued within 29 minutes.
 const IDLE_ROUND: Duration = Duration::from_secs(10);
 
-/// The task that watches a folder in the sandbox.
-pub const IDLE_TASK: &str = "idle";
-
-/// What the IDLE task emits when the mailbox changed.
-pub const CHANGED: &[u8] = b"changed";
-
-/// What the UI tells the IDLE task.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub enum Command {
-    /// Watch `folder` on the server `config` names, instead of whatever it
-    /// watched before.
-    Watch {
-        config: EmailClientConfig,
-        folder: String,
-    },
-    /// Watch nothing, and wait for the next `Watch`.
-    Stop,
-    /// A refreshed OAuth access token, for the next connection.
-    Token(String),
-}
-
 // ---------------------------------------------------------------------------
 // IdleController
 // ---------------------------------------------------------------------------
@@ -60,11 +36,7 @@ pub struct IdleController {
     /// re-rendering the same folder does not restart the watch.
     watching: Option<(String, String, String)>,
     /// Stops the running watcher; `None` when nothing is running.
-    #[cfg(not(target_arch = "wasm32"))]
     stop: Option<Arc<AtomicBool>>,
-    /// The task watching, in the sandbox.
-    #[cfg(target_arch = "wasm32")]
-    task: Option<u64>,
     /// The OAuth access token the IDLE session should authenticate with.
     ///
     /// Shared rather than copied into the watcher: the token refresh in
@@ -79,10 +51,7 @@ impl IdleController {
         IdleController {
             notify,
             watching: None,
-            #[cfg(not(target_arch = "wasm32"))]
             stop: None,
-            #[cfg(target_arch = "wasm32")]
-            task: None,
             token: Arc::new(Mutex::new(String::new())),
         }
     }
@@ -102,27 +71,27 @@ impl IdleController {
         self.watching = Some(key);
         *self.token.lock().expect("token mutex") = config.oauth_access_token.clone();
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let stop = Arc::new(AtomicBool::new(false));
-            self.stop = Some(Arc::clone(&stop));
-            let notify = Arc::clone(&self.notify);
-            let token = Arc::clone(&self.token);
-            let _ = std::thread::Builder::new()
-                .name("email-idle".to_owned())
-                .spawn(move || {
-                    idle_loop(
-                        &config,
-                        &folder,
-                        &|| stop.load(Ordering::Acquire),
-                        &|| notify.store(true, Ordering::Relaxed),
-                        &|| Some(token.lock().expect("token mutex").clone()),
-                    )
-                });
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        self.tell(&Command::Watch { config, folder });
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop = Some(Arc::clone(&stop));
+        let notify = Arc::clone(&self.notify);
+        let token = Arc::clone(&self.token);
+        let _ = std::thread::Builder::new()
+            .name("email-idle".to_owned())
+            .spawn(move || {
+                idle_loop(
+                    &config,
+                    &folder,
+                    &|| stop.load(Ordering::Acquire),
+                    // A watcher told to stop may still be in its last round:
+                    // what it sees then is not about the folder on screen.
+                    &|| {
+                        if !stop.load(Ordering::Acquire) {
+                            notify.store(true, Ordering::Relaxed);
+                        }
+                    },
+                    &|| Some(token.lock().expect("token mutex").clone()),
+                )
+            });
     }
 
     /// Publish a freshly refreshed OAuth access token to the running session.
@@ -132,10 +101,6 @@ impl IdleController {
     /// as any other long-lived IMAP connection.
     pub fn update_token(&mut self, access_token: &str) {
         *self.token.lock().expect("token mutex") = access_token.to_owned();
-        #[cfg(target_arch = "wasm32")]
-        if self.task.is_some() {
-            self.tell(&Command::Token(access_token.to_owned()));
-        }
     }
 
     /// Stop watching. Returns at once: the watcher notices within a round.
@@ -143,71 +108,15 @@ impl IdleController {
         if self.watching.take().is_none() {
             return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(stop) = self.stop.take() {
             stop.store(true, Ordering::Release);
         }
-        #[cfg(target_arch = "wasm32")]
-        if self.task.is_some() {
-            self.tell(&Command::Stop);
-        }
-    }
-
-    /// Hand the IDLE task `command`, starting the task with it if there is
-    /// none (or the one there was has gone).
-    #[cfg(target_arch = "wasm32")]
-    fn tell(&mut self, command: &Command) {
-        let Ok(bytes) = serde_json::to_vec(command) else {
-            return;
-        };
-        if let Some(id) = self.task {
-            if sicompass_pdk::tasks::send(id, &bytes).is_ok() {
-                return;
-            }
-            sicompass_pdk::tasks::cancel(id);
-            self.task = None;
-        }
-        // Only a watch starts a task: there is nothing to stop, and a token
-        // arrives with the next watch anyway.
-        if matches!(command, Command::Watch { .. }) {
-            match sicompass_pdk::tasks::spawn(IDLE_TASK, &bytes) {
-                Ok(id) => self.task = Some(id),
-                Err(e) => {
-                    self.watching = None;
-                    sicompass_pdk::host::log(&format!("emailclient: no IDLE task: {e}"));
-                }
-            }
-        }
-    }
-
-    /// An event from the IDLE task. `true` when it was this watcher's.
-    #[cfg(target_arch = "wasm32")]
-    pub fn on_task_event(&mut self, id: u64, event: &sicompass_pdk::TaskEvent) -> bool {
-        if self.task != Some(id) {
-            return false;
-        }
-        match event {
-            sicompass_pdk::TaskEvent::Progress(b) if b.as_slice() == CHANGED => {
-                self.notify.store(true, Ordering::Relaxed);
-            }
-            sicompass_pdk::TaskEvent::Done(_) => {
-                // Gone: the next folder render starts another.
-                self.task = None;
-                self.watching = None;
-            }
-            _ => {}
-        }
-        true
     }
 }
 
 impl Drop for IdleController {
     fn drop(&mut self) {
         self.stop();
-        #[cfg(target_arch = "wasm32")]
-        if let Some(id) = self.task.take() {
-            sicompass_pdk::tasks::cancel(id);
-        }
     }
 }
 
@@ -289,68 +198,6 @@ fn is_mailbox_change(response: &UnsolicitedResponse) -> bool {
     )
 }
 
-/// The IDLE task itself, in the sandbox: its input is the first
-/// [`Command::Watch`], its inbox brings the ones after it, and it emits
-/// [`CHANGED`]. It lives as long as the plugin.
-#[cfg(target_arch = "wasm32")]
-pub fn run_idle_task(input: &[u8]) -> Result<Vec<u8>, String> {
-    use sicompass_pdk::tasks;
-    use std::cell::RefCell;
-
-    let first: Command = serde_json::from_slice(input).map_err(|e| e.to_string())?;
-    let target: RefCell<Option<(EmailClientConfig, String)>> = RefCell::new(None);
-    let token = RefCell::new(String::new());
-    // Set when a watch or a stop arrived, so the session in progress ends.
-    let retarget = RefCell::new(false);
-    let apply = |command: Command| match command {
-        Command::Watch { config, folder } => {
-            *token.borrow_mut() = config.oauth_access_token.clone();
-            *target.borrow_mut() = Some((config, folder));
-            *retarget.borrow_mut() = true;
-        }
-        Command::Stop => {
-            *target.borrow_mut() = None;
-            *retarget.borrow_mut() = true;
-        }
-        Command::Token(t) => *token.borrow_mut() = t,
-    };
-    let drain = || {
-        while let Some(bytes) = tasks::receive(0) {
-            if let Ok(command) = serde_json::from_slice(&bytes) {
-                apply(command);
-            }
-        }
-    };
-    apply(first);
-
-    while !tasks::cancelled() {
-        *retarget.borrow_mut() = false;
-        let Some((config, folder)) = target.borrow().clone() else {
-            // Nothing to watch: wait for a command.
-            if let Some(bytes) = tasks::receive(1000)
-                && let Ok(command) = serde_json::from_slice(&bytes)
-            {
-                apply(command);
-            }
-            continue;
-        };
-        idle_loop(
-            &config,
-            &folder,
-            &|| {
-                drain();
-                tasks::cancelled() || *retarget.borrow()
-            },
-            &|| tasks::emit(CHANGED),
-            &|| {
-                drain();
-                Some(token.borrow().clone())
-            },
-        );
-    }
-    Ok(Vec::new())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -395,8 +242,8 @@ mod tests {
     }
 
     /// Every uncached render of a folder asks to watch it. Only the first
-    /// may start a watcher: in the sandbox each start is a task, and a task
-    /// blocked in IDLE holds its slot until its round ends.
+    /// may start a watcher: each start is a thread and an IMAP connection,
+    /// and a watcher blocked in IDLE only ends when its round does.
     #[test]
     fn watching_the_same_folder_again_changes_nothing() {
         let notify = Arc::new(AtomicBool::new(false));
@@ -422,27 +269,6 @@ mod tests {
         ctrl.stop();
         ctrl.start(config, "Archive".to_owned());
         assert!(!Arc::ptr_eq(&second, ctrl.stop.as_ref().unwrap()));
-    }
-
-    #[test]
-    fn a_command_survives_the_trip_to_the_task() {
-        let command = Command::Watch {
-            config: EmailClientConfig {
-                imap_url: "imaps://imap.example.com".to_owned(),
-                oauth_access_token: "ya29".to_owned(),
-                ..Default::default()
-            },
-            folder: "INBOX".to_owned(),
-        };
-        let back: Command = serde_json::from_slice(&serde_json::to_vec(&command).unwrap()).unwrap();
-        match back {
-            Command::Watch { config, folder } => {
-                assert_eq!(folder, "INBOX");
-                assert_eq!(config.imap_url, "imaps://imap.example.com");
-                assert_eq!(config.oauth_access_token, "ya29");
-            }
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]

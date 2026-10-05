@@ -8,64 +8,81 @@ checkout next to this one (`../sicompass`), whose `/commit-and-push`,
 `/release`, `/sync` and `/update-cargo` take this repo's name as their first
 argument and then follow the skills in this repo's `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` is `emailclient` and its
   `displayName` `email client` is the settings section (the keys the built-in
-  had, so saved values carry over). It asks for `sockets` on 993 (IMAPS), 465
+  had, so saved values carry over). Permissions, which declare what the plugin
+  does and are shown to the user before install: `sockets` on 993 (IMAPS), 465
   (SMTPS) and 587 (SMTP with STARTTLS) of any server (the mail server is the
-  user's choice; the host never lets it reach the local network), approved at
-  install, `allowedHosts` for Google's token and userinfo endpoints, and
-  `storage`.
+  user's choice), `allowedHosts` for Google's token and userinfo endpoints,
+  and `storage`.
 - `locales/<lang>.ftl`, every id prefixed `emailclient-`, in all four
-  languages.
+  languages. `src/localize.rs` asks the app (`host::translate`), and in the
+  unit tests, which run outside sicompass, reads `en-US.ftl`.
+- `src/lib.rs` is the provider (`EmailClientProvider`, `impl Plugin`), and
+  `src/main.rs` makes it the program.
 
-## The sandbox, and what it changes
+## How it works
 
-A call into the plugin's UI instance has a 10-second deadline, and an IMAP
-round trip can take longer, so the network is never touched there:
+Every call from the app has a 10-second deadline, after which the app ends the
+plugin, and an IMAP round trip can take longer, so the mail servers are never
+contacted on a call:
 
-- **The worker** (`worker.rs`, `worker::WORKER_TASK`) is one long-lived host
-  task holding the one IMAP connection. The UI sends it `Job`s through the task
-  inbox (`tasks.send`) and it answers `Done`s with `tasks.emit`, JSON both ways.
-  `apply_done` puts an answer in the result slot the rendering code already
-  looked in. Natively (the tests) the same loop is a thread with channels.
+- **The worker** (`worker.rs`) is one thread for the plugin's life, holding the
+  one IMAP connection. The UI side sends it `Job`s over a channel and it
+  answers `Done`s, JSON both ways. `poll` drains them, and `apply_done` puts
+  each answer in the result slot the rendering code already looked in. A
+  worker whose thread ended (a panic in a job) is noticed there too
+  (`worker_ended`), so nothing waits on it, and the next job starts another.
   Tests that inject a `MockImap` stay on the synchronous path (`bg_enabled`).
-- **IDLE** (`idle.rs`, `idle::IDLE_TASK`) is its own task, emitting `changed`.
-  A refreshed OAuth token reaches it through its inbox.
-- **The Google sign-in** (`oauth2.rs`, `oauth2::OAUTH_TASK`) is a task that
-  asks the host to run the browser redirect (`desktop.oauth-redirect`: a plugin
-  cannot listen), then exchanges the code. Natively the tests play the browser
-  against a loopback listener.
-- **IMAP** is the blocking `imap` 3 crate over `connection::ImapStream`: a host
-  socket (`sockets.resolve`, then `std::net::TcpStream`) and rustls with ring,
-  with the webpki roots. `imap://` in the clear is refused unless every address
-  is loopback, which only the fake server in `fake_imap_tests.rs` is.
+- **IDLE** (`idle.rs`) is a thread per watched folder, raising the flag `poll`
+  turns into `needs_refresh`. It waits in 10-second rounds and checks between
+  them whether it was stopped. A refreshed OAuth token reaches it through a
+  shared slot.
+- **The Google sign-in** (`oauth2.rs`) runs on a thread of its own: it asks
+  the app to run the browser redirect
+  (`sicompass_sdk::plugin::desktop::oauth_redirect`, RFC 8252: the app opens
+  the browser and listens once on a loopback port), then exchanges the code
+  and asks Google for the address. `PendingAuthorize::poll` picks the result
+  up. Outside sicompass (the tests) the app is not there, so it fails at once
+  without reaching Google.
+- **IMAP** is the blocking `imap` 3 crate over `connection::ImapStream`: a
+  `std::net::TcpStream` (resolved with `ToSocketAddrs`, connected with
+  `connect_timeout`) and rustls with ring, with the webpki roots. `imap://` in
+  the clear is refused unless every address is loopback, which only the fake
+  server in `fake_imap_tests.rs` is.
 - **SMTP** is a few commands by hand in `net.rs` (`Smtp`), implicit TLS for
   `smtps://` and STARTTLS for `smtp://`. lettre only builds the message.
 - **The envelope cache** (`cache.rs`) is one JSON file per account in
-  `/storage/cache`, opened lazily so only the worker ever opens it. It was
-  SQLite, which needs C emulation libraries to build for WASI and has no file
-  locks there.
+  `storage_dir()/cache`, opened lazily so only the worker ever opens it. It
+  was SQLite. Two tabs are two processes, and the last write wins, which is
+  harmless for a copy of what the server has.
 - **The sign-in** (OAuth tokens, and the servers and address it filled in) is
-  kept in the plugin's storage folder (`/storage/email.json`, in the shape of a
+  kept in the plugin's storage folder
+  (`sicompass_sdk::plugin::storage_dir()/email.json`, in the shape of a
   settings file), since a plugin cannot write the app's settings. The settings
   the manifest declares are read at `init`, and a saved sign-in takes over.
-- **HTTP** (Google's endpoints only) goes through `src/http.rs`: the host's
-  `net.fetch` in the sandbox, reqwest natively.
+- **HTTP** (Google's endpoints only) goes through `src/http.rs`, a small
+  client in the shape of `reqwest::blocking` over `ureq` (rustls with ring and
+  bundled roots). A token refresh before a send runs on a call from the app,
+  so a request times out after 8 seconds.
 - **Undo** entries are `ProviderOp`s: the IMAP action's name and its fields as
   an FFON list (`encode_op`, `decode_op`).
+- The tests never reach a real mail server or Google: a fake IMAP server on
+  loopback, one-shot HTTP servers on loopback, and the sign-in failing outside
+  sicompass.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools`, `jq`, and clang for ring's C (`CC_wasm32_wasip2`: the
-host's gcc cannot target wasm, and ring needs no libc headers). Nothing is
-installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no std for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -93,8 +110,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -117,6 +134,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/emailclient.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.

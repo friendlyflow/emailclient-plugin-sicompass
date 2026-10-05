@@ -3,9 +3,8 @@
 //! `RealImap` implements `ImapBackend` on the blocking `imap` crate over the
 //! TLS stream in `connection.rs`; `RealSmtp` implements `SmtpBackend` by
 //! speaking SMTP itself over the same kind of stream, with lettre building the
-//! message. Both are built from `EmailClientConfig`, and both block: in the
-//! sandbox they run in the plugin's worker task, natively on its thread,
-//! never in a call from the app.
+//! message. Both are built from `EmailClientConfig`, and both block: they run
+//! on the plugin's worker thread, never in a call from the app.
 //!
 //! Every read and write is bounded by [`IMAP_TIMEOUT`] (the socket timeouts
 //! `connection.rs` sets), so a server that accepted the connection and then
@@ -35,9 +34,8 @@ pub struct RealImap {
     config: EmailClientConfig,
     session: Option<ImapSession>,
     /// Opened on first use, so a copy that never lists a folder (the UI's,
-    /// when the worker does the fetching) never opens the database: two
-    /// instances writing one SQLite file from separate sandboxes is asking
-    /// for a corrupt cache.
+    /// when the worker does the fetching) never opens the cache file, which
+    /// the worker writes.
     cache: Option<EnvelopeCache>,
     cache_opened: bool,
     /// Separate connection used only for `UID THREAD`; see `fetch_threads`.

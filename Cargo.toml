@@ -1,5 +1,4 @@
-# Its own workspace root: a plugin, only ever built for wasm32-wasip2 (and
-# natively for its unit tests).
+# Its own workspace root: a plugin, a program of its own that sicompass starts.
 [workspace]
 
 [package]
@@ -7,25 +6,28 @@ name = "emailclient-plugin"
 version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "IMAP and SMTP email for sicompass: folders, messages and a compose form as lists, as a WASM plugin"
+description = "IMAP and SMTP email for sicompass: folders, messages and a compose form as lists, as a plugin"
 repository = "https://github.com/friendlyflow/emailclient-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 
-[lib]
-crate-type = ["cdylib"]
+# The program sicompass starts (src/main.rs). The client is the library, which
+# the unit tests use.
+[[bin]]
+name = "emailclient-plugin"
+path = "src/main.rs"
 
 [dependencies]
-# The guest kit and the FFON model, from crates.io.
-sicompass-pdk = "0.6.0"
-sicompass-sdk = { version = "0.9.0", default-features = false }
+# The plugin kit (`plugin`) and the FFON model, from crates.io.
+sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# IMAP, blocking, over the stream `connection.rs` opens (a host socket and
-# rustls in the sandbox). imap-proto for the response types it hands back.
+# IMAP, blocking, over the stream `connection.rs` opens (a TCP socket and
+# rustls). imap-proto for the response types it hands back.
 imap = { version = "3.0.0-alpha.15", default-features = false }
 imap-proto = "0.16"
-# TLS in the guest. ring is the crypto, and it builds for wasm32 with clang.
+# TLS for IMAP and SMTP. ring is the crypto (aws-lc-rs would need cmake and a
+# musl C toolchain for the static Linux build), with the webpki roots bundled.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
 # Building messages. SMTP itself is a few commands over `connection::open_tls`.
@@ -33,25 +35,25 @@ lettre = { version = "0.11", default-features = false, features = ["builder"] }
 base64 = "0.22"
 quoted_printable = "0.5"
 
-# HTTP natively, for the tests. Inside the sandbox every request goes through
-# the host's `net.fetch`.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }
+# The HTTP to Google's OAuth endpoints. rustls (ring) with bundled roots, so
+# the static musl build needs no system TLS library.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
-# Guests ship as bytecode, and App Store builds interpret rather than JIT them, so
-# a small module matters more than aggressive inlining.
+# One small executable per platform, downloaded by the Store.
 opt-level = "s"
 lto = true
 strip = true
+codegen-units = 1
 
 # Working on the SDK and this plugin together: uncomment, and comment it out
 # again before committing. With it live, a green build proves nothing about what
 # the published crates resolve to.
 #
-# [patch.crates-io]
-# sicompass-pdk = { path = "../sicompass-plugin-sdk/sicompass-pdk" }
-# sicompass-sdk = { path = "../sicompass-plugin-sdk" }
+# TEMPORARY, until sicompass-sdk 0.9.1 is on crates.io: the SDK commit with the
+# plugin kit (`plugin` feature), by git rev. Remove this section at the release.
+[patch.crates-io]
+sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "60dfd27f7c0949ea8d22fe41d0a331c38ed65ae3" }

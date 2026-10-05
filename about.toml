@@ -12,7 +12,11 @@
 
 # Only the platforms this repo actually ships for.
 targets = [
-    "wasm32-wasip2",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ]
 
 ignore-build-dependencies = true
@@ -52,7 +56,4 @@ ignore = true
 # their GPL scoped to each crate only. The global list above stays GPL-free, so
 # any *other* dependency that pulls in GPL still trips the gate.
 [sicompass-sdk]
-accepted = ["GPL-3.0-only"]
-
-[sicompass-pdk]
 accepted = ["GPL-3.0-only"]

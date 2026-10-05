@@ -8,3 +8,4 @@ graphify-out/
 .claude/settings.local.json
 plugin.wasm
 dist/
+build/

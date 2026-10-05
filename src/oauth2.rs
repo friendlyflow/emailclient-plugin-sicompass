@@ -1,26 +1,20 @@
 //! Google OAuth2 authorization flow — port of `oauth2.c`.
 //!
-//! The browser comes back to a loopback port with the authorization code,
-//! which is exchanged for tokens at the Google token endpoint. In the sandbox a
-//! plugin cannot listen, so the host does it (`desktop.oauth-redirect`), in a
-//! task ([`OAUTH_TASK`]) since it waits for the user. Natively, for the tests,
-//! a thread listens itself.
+//! The sign-in is the desktop-app flow of RFC 8252: the app opens Google's
+//! page in the user's browser and listens once on a loopback port for the
+//! redirect (`sicompass_sdk::plugin::desktop::oauth_redirect`), and the
+//! authorization code it brings back is exchanged for tokens at the Google
+//! token endpoint. That waits for the user, so it runs on a thread of its own,
+//! and [`PendingAuthorize::poll`] picks up the result.
 
 use crate::http::Client;
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::{Read, Write};
-#[cfg(not(target_arch = "wasm32"))]
-use std::net::TcpListener;
-#[cfg(not(target_arch = "wasm32"))]
+use sicompass_sdk::plugin::OauthReply;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-
-/// The task that runs a sign-in in the sandbox.
-pub const OAUTH_TASK: &str = "oauth";
 
 /// Seconds since the Unix epoch.
 pub fn now_secs() -> i64 {
@@ -54,143 +48,12 @@ pub struct OAuth2TokenResult {
 
 /// An in-flight OAuth2 authorization request. Created by [`start`]; poll it
 /// each frame with [`PendingAuthorize::poll`] until it returns `Some`.
-#[cfg(not(target_arch = "wasm32"))]
 pub struct PendingAuthorize {
     rx: std::sync::mpsc::Receiver<OAuth2TokenResult>,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
 }
 
-/// In the sandbox: the sign-in task, and its answer once it came.
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug)]
-pub struct PendingAuthorize {
-    task: u64,
-    result: std::cell::RefCell<Option<OAuth2TokenResult>>,
-    deadline: Instant,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl PendingAuthorize {
-    /// Non-blocking check, as natively.
-    pub fn poll(&self) -> Option<OAuth2TokenResult> {
-        if let Some(r) = self.result.borrow_mut().take() {
-            return Some(r);
-        }
-        if Instant::now() >= self.deadline {
-            self.cancel();
-            return Some(OAuth2TokenResult {
-                error: "timed out waiting for Google authorization".to_owned(),
-                ..Default::default()
-            });
-        }
-        None
-    }
-
-    pub fn cancel(&self) {
-        sicompass_pdk::tasks::cancel(self.task);
-    }
-
-    /// The sign-in task's answer. `true` when the event was its.
-    pub fn on_task_event(&self, id: u64, event: &sicompass_pdk::TaskEvent) -> bool {
-        if id != self.task {
-            return false;
-        }
-        let answer = match event {
-            sicompass_pdk::TaskEvent::Progress(_) => return true,
-            sicompass_pdk::TaskEvent::Done(Ok(bytes)) => serde_json::from_slice(bytes)
-                .unwrap_or_else(|e| OAuth2TokenResult {
-                    error: format!("sign-in: {e}"),
-                    ..Default::default()
-                }),
-            sicompass_pdk::TaskEvent::Done(Err(e)) => OAuth2TokenResult {
-                error: format!("sign-in stopped: {e}"),
-                ..Default::default()
-            },
-        };
-        *self.result.borrow_mut() = Some(answer);
-        true
-    }
-}
-
-/// Start the sign-in in the sandbox: a task that asks the host to run the
-/// browser redirect, then exchanges the code.
-#[cfg(target_arch = "wasm32")]
-pub fn start(
-    client_id: &str,
-    client_secret: &str,
-    timeout_secs: u64,
-) -> Result<PendingAuthorize, OAuth2TokenResult> {
-    if client_id.is_empty() || client_secret.is_empty() {
-        return Err(OAuth2TokenResult {
-            error: "client ID and client secret are required".to_owned(),
-            ..Default::default()
-        });
-    }
-    let job = serde_json::json!({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "timeout": timeout_secs,
-    });
-    let task =
-        sicompass_pdk::tasks::spawn(OAUTH_TASK, job.to_string().as_bytes()).map_err(|e| {
-            OAuth2TokenResult {
-                error: format!("cannot start the sign-in: {e}"),
-                ..Default::default()
-            }
-        })?;
-    Ok(PendingAuthorize {
-        task,
-        result: std::cell::RefCell::new(None),
-        // A little past the host's own wait, so its answer arrives first.
-        deadline: Instant::now() + Duration::from_secs(timeout_secs + 15),
-    })
-}
-
-/// The sign-in task itself, in the sandbox.
-#[cfg(target_arch = "wasm32")]
-pub fn run_oauth_task(input: &[u8]) -> Result<Vec<u8>, String> {
-    let job: serde_json::Value = serde_json::from_slice(input).map_err(|e| e.to_string())?;
-    let field = |k: &str| job.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    let (client_id, client_secret) = (field("client_id"), field("client_secret"));
-    let timeout = job.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300) as u32;
-    let auth_url = format!(
-        "{GOOGLE_AUTH_URL}?client_id={client_id}&redirect_uri={{redirect-uri}}&\
-         response_type=code&scope={scope}&access_type=offline&prompt=consent",
-        client_id = percent_encode(&client_id),
-        scope = percent_encode(OAUTH2_SCOPE),
-    );
-    let result = match sicompass_pdk::desktop::oauth_redirect(&auth_url, timeout) {
-        Err(e) => OAuth2TokenResult {
-            error: e,
-            ..Default::default()
-        },
-        Ok(reply) => {
-            let line = format!("GET /?{} HTTP/1.1", reply.query);
-            if reply.query.split('&').any(|kv| kv.starts_with("error=")) {
-                OAuth2TokenResult {
-                    error: "Google returned an error response".to_owned(),
-                    ..Default::default()
-                }
-            } else if let Some(code) = extract_query_param(&line, "code") {
-                let mut tokens =
-                    exchange_code(&code, &client_id, &client_secret, &reply.redirect_uri);
-                if tokens.success {
-                    tokens.email = fetch_email(&tokens.access_token).unwrap_or_default();
-                }
-                tokens
-            } else {
-                OAuth2TokenResult {
-                    error: "no authorization code in redirect".to_owned(),
-                    ..Default::default()
-                }
-            }
-        }
-    };
-    serde_json::to_vec(&result).map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for PendingAuthorize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAuthorize")
@@ -199,7 +62,6 @@ impl std::fmt::Debug for PendingAuthorize {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl PendingAuthorize {
     /// Non-blocking check. Returns `Some(result)` once the worker finishes
     /// (success, error, or timeout), `None` while still waiting.
@@ -226,7 +88,9 @@ impl PendingAuthorize {
         }
     }
 
-    /// Signal the worker thread to stop and return immediately on next poll.
+    /// Give up on the sign-in: whatever the browser still brings back is
+    /// dropped. The app's wait for the browser cannot be cut short, and the
+    /// thread ends when it does.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -238,11 +102,9 @@ impl PendingAuthorize {
 
 /// Start the OAuth2 authorization flow asynchronously.
 ///
-/// Binds a local HTTP listener, opens the browser, spawns a worker thread
-/// that waits for the redirect, and returns a [`PendingAuthorize`] handle
-/// immediately. Call [`PendingAuthorize::poll`] each frame until it returns
-/// `Some`.
-#[cfg(not(target_arch = "wasm32"))]
+/// Spawns a thread that has the app run the browser sign-in and then
+/// exchanges the code, and returns a [`PendingAuthorize`] handle immediately.
+/// Call [`PendingAuthorize::poll`] each frame until it returns `Some`.
 pub fn start(
     client_id: &str,
     client_secret: &str,
@@ -255,65 +117,92 @@ pub fn start(
         });
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| OAuth2TokenResult {
-        error: format!("failed to start local server: {e}"),
-        ..Default::default()
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| OAuth2TokenResult {
-            error: format!("failed to set listener non-blocking: {e}"),
-            ..Default::default()
-        })?;
-
-    let port = listener
-        .local_addr()
-        .map_err(|e| OAuth2TokenResult {
-            error: format!("failed to get listener address: {e}"),
-            ..Default::default()
-        })?
-        .port();
-    let redirect_uri = format!("http://localhost:{port}");
-
-    let auth_url = format!(
-        "{GOOGLE_AUTH_URL}?client_id={client_id}&redirect_uri={redir}&\
-         response_type=code&scope={scope}&access_type=offline&prompt=consent",
-        client_id = percent_encode(client_id),
-        redir = percent_encode(&redirect_uri),
-        scope = percent_encode(OAUTH2_SCOPE),
-    );
-    // Natively this flow is the tests', which play the browser themselves, so
-    // nothing is opened. In the sandbox the host opens it (`run_oauth_task`).
-    let _ = auth_url;
-
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<OAuth2TokenResult>();
     let cancel_worker = Arc::clone(&cancel);
     let client_id = client_id.to_owned();
     let client_secret = client_secret.to_owned();
+    let wait = u32::try_from(timeout_secs).unwrap_or(u32::MAX);
 
-    std::thread::spawn(move || {
-        let result = accept_and_exchange(
-            listener,
-            &cancel_worker,
-            &client_id,
-            &client_secret,
-            &redirect_uri,
-        );
-        let _ = tx.send(result);
-    });
+    std::thread::Builder::new()
+        .name("email-oauth".to_owned())
+        .spawn(move || {
+            let reply = sicompass_sdk::plugin::desktop::oauth_redirect(&auth_url(&client_id), wait);
+            let result = if cancel_worker.load(Ordering::Relaxed) {
+                OAuth2TokenResult {
+                    error: "login cancelled".to_owned(),
+                    ..Default::default()
+                }
+            } else {
+                finish_redirect(reply, &client_id, &client_secret)
+            };
+            let _ = tx.send(result);
+        })
+        .map_err(|e| OAuth2TokenResult {
+            error: format!("cannot start the sign-in: {e}"),
+            ..Default::default()
+        })?;
 
     Ok(PendingAuthorize {
         rx,
         cancel,
-        deadline: Instant::now() + Duration::from_secs(timeout_secs),
+        // A little past the app's own wait, so its answer arrives first.
+        deadline: Instant::now() + Duration::from_secs(timeout_secs + 15),
     })
+}
+
+/// Google's sign-in page for `client_id`. The app replaces `{redirect-uri}`
+/// with its loopback address, percent-encoded.
+fn auth_url(client_id: &str) -> String {
+    format!(
+        "{GOOGLE_AUTH_URL}?client_id={client_id}&redirect_uri={{redirect-uri}}&\
+         response_type=code&scope={scope}&access_type=offline&prompt=consent",
+        client_id = percent_encode(client_id),
+        scope = percent_encode(OAUTH2_SCOPE),
+    )
+}
+
+/// What the browser brought back, made into tokens: Google's refusal, a
+/// missing code, or the code exchanged at the token endpoint (with the
+/// redirect URI the app used, which Google checks), plus the signed-in
+/// address.
+fn finish_redirect(
+    reply: Result<OauthReply, String>,
+    client_id: &str,
+    client_secret: &str,
+) -> OAuth2TokenResult {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(e) => {
+            return OAuth2TokenResult {
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+    let line = format!("GET /?{} HTTP/1.1", reply.query);
+    if reply.query.split('&').any(|kv| kv.starts_with("error=")) {
+        return OAuth2TokenResult {
+            error: "Google returned an error response".to_owned(),
+            ..Default::default()
+        };
+    }
+    let Some(code) = extract_query_param(&line, "code") else {
+        return OAuth2TokenResult {
+            error: "no authorization code in redirect".to_owned(),
+            ..Default::default()
+        };
+    };
+    let mut tokens = exchange_code(&code, client_id, client_secret, &reply.redirect_uri);
+    if tokens.success {
+        tokens.email = fetch_email(&tokens.access_token).unwrap_or_default();
+    }
+    tokens
 }
 
 /// Start the OAuth2 authorization flow and block until completion or timeout.
 ///
 /// Convenience wrapper for callers (and tests) that can afford to block.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn authorize(client_id: &str, client_secret: &str, timeout_secs: u64) -> OAuth2TokenResult {
     match start(client_id, client_secret, timeout_secs) {
         Err(e) => e,
@@ -375,104 +264,6 @@ pub fn refresh_token(client_id: &str, client_secret: &str, refresh_tok: &str) ->
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Worker: non-blocking accept loop that checks `cancel` between attempts.
-/// On a successful connection it reads the request, sends the success page,
-/// and exchanges the auth code — all on this worker thread.
-#[cfg(not(target_arch = "wasm32"))]
-fn accept_and_exchange(
-    listener: TcpListener,
-    cancel: &AtomicBool,
-    client_id: &str,
-    client_secret: &str,
-    redirect_uri: &str,
-) -> OAuth2TokenResult {
-    let sleep = Duration::from_millis(50);
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return OAuth2TokenResult {
-                error: "login cancelled".to_owned(),
-                ..Default::default()
-            };
-        }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-
-                let mut buf = [0u8; 4096];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return OAuth2TokenResult {
-                            error: "failed to read redirect request".to_owned(),
-                            ..Default::default()
-                        };
-                    }
-                };
-                let request = match std::str::from_utf8(&buf[..n]) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return OAuth2TokenResult {
-                            error: "invalid UTF-8 in redirect request".to_owned(),
-                            ..Default::default()
-                        };
-                    }
-                };
-
-                let first_line = request.lines().next().unwrap_or("");
-
-                // Always send a response so the browser tab closes cleanly.
-                let (status, body) =
-                    if first_line.contains("error=") || !first_line.contains("code=") {
-                        (
-                            "400 Bad Request",
-                            "<html><body><h2>Authentication failed</h2>\
-                         <p>You can close this tab and return to sicompass.</p>\
-                         </body></html>",
-                        )
-                    } else {
-                        (
-                            "200 OK",
-                            "<html><body><h2>Authentication successful</h2>\
-                         <p>You can close this tab and return to sicompass.</p>\
-                         </body></html>",
-                        )
-                    };
-                let response =
-                    format!("HTTP/1.1 {status}\r\nContent-Type: text/html\r\n\r\n{body}");
-                let _ = stream.write_all(response.as_bytes());
-
-                if first_line.contains("error=") {
-                    return OAuth2TokenResult {
-                        error: "Google returned an error response".to_owned(),
-                        ..Default::default()
-                    };
-                }
-
-                let code = match extract_query_param(first_line, "code") {
-                    Some(c) => c,
-                    None => {
-                        return OAuth2TokenResult {
-                            error: "no authorization code in redirect".to_owned(),
-                            ..Default::default()
-                        };
-                    }
-                };
-
-                return exchange_code(&code, client_id, client_secret, redirect_uri);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(sleep);
-            }
-            Err(e) => {
-                return OAuth2TokenResult {
-                    error: format!("accept error: {e}"),
-                    ..Default::default()
-                };
-            }
-        }
-    }
-}
 
 fn extract_query_param(get_line: &str, param: &str) -> Option<String> {
     // GET /?code=XXXX&... HTTP/1.1
@@ -697,5 +488,63 @@ mod tests {
         let result = handle.poll().unwrap();
         assert!(!result.success);
         assert!(result.error.contains("timed out"));
+    }
+
+    /// The app runs the browser part. Outside sicompass there is no app, so
+    /// the sign-in ends at once, saying why, and nothing reaches Google.
+    #[test]
+    fn a_sign_in_outside_sicompass_says_why() {
+        let handle = start("id", "secret", 5).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            if let Some(r) = handle.poll() {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "no answer");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!result.success);
+        assert!(
+            result.error.contains("not running inside sicompass"),
+            "{}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn the_sign_in_page_leaves_the_redirect_to_the_app() {
+        let url = auth_url("123-abc.apps.googleusercontent.com");
+        assert!(url.starts_with(GOOGLE_AUTH_URL), "{url}");
+        assert!(
+            url.contains("client_id=123-abc.apps.googleusercontent.com&"),
+            "{url}"
+        );
+        assert!(url.contains("redirect_uri={redirect-uri}&"), "{url}");
+        assert!(
+            url.contains("scope=https%3A%2F%2Fmail.google.com%2F%20email%20profile"),
+            "{url}"
+        );
+        assert!(url.contains("access_type=offline"), "{url}");
+    }
+
+    #[test]
+    fn a_redirect_without_a_code_is_refused_before_any_exchange() {
+        let reply = |query: &str| {
+            Ok(OauthReply {
+                query: query.to_owned(),
+                redirect_uri: "http://127.0.0.1:4242".to_owned(),
+            })
+        };
+        let refused = finish_redirect(reply("error=access_denied"), "id", "secret");
+        assert!(!refused.success);
+        assert_eq!(refused.error, "Google returned an error response");
+
+        let no_code = finish_redirect(reply("state=xyz"), "id", "secret");
+        assert!(!no_code.success);
+        assert_eq!(no_code.error, "no authorization code in redirect");
+
+        let failed = finish_redirect(Err("the browser was closed".to_owned()), "id", "secret");
+        assert!(!failed.success);
+        assert_eq!(failed.error, "the browser was closed");
     }
 }

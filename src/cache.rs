@@ -7,11 +7,12 @@
 //! are flushed and rebuilt from scratch.
 //!
 //! One JSON file per account, `cache/<hex_username>.json` in the plugin's
-//! storage folder (natively, for the tests, `$XDG_CACHE_HOME/sicompass/email`
-//! or `~/.cache/sicompass/email`), rewritten whole after each change. It used
-//! to be SQLite, which does not build for the sandbox without C emulation
-//! libraries, and has no file locking there. There is one writer: the
-//! background worker, the only copy of the plugin that fetches.
+//! storage folder (in the unit tests, which run outside sicompass,
+//! `$XDG_CACHE_HOME/sicompass/email`), rewritten whole after each change
+//! through a temporary file and a rename. It used to be SQLite. In a process
+//! there is one writer, the background worker, the only part of the plugin
+//! that fetches. Two tabs are two processes, and the last write wins, which
+//! is harmless for a copy of what the server has.
 
 use crate::MessageHeader;
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,17 @@ use std::path::PathBuf;
 
 /// Where the cache files live.
 fn cache_dir() -> Option<PathBuf> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        Some(PathBuf::from(sicompass_pdk::STORAGE_DIR).join("cache"))
+    if let Some(storage) = sicompass_sdk::plugin::storage_dir() {
+        return Some(storage.join("cache"));
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    // Outside sicompass there is no storage folder. Only the tests get one
+    // instead (the fake IMAP tests point `XDG_CACHE_HOME` at a scratch
+    // directory); anything else runs uncached.
+    #[cfg(not(test))]
+    {
+        None
+    }
+    #[cfg(test)]
     {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .filter(|v| !v.is_empty())
