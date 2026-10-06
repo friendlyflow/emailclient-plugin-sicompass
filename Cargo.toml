@@ -22,18 +22,28 @@ path = "src/main.rs"
 sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# IMAP, blocking, over the stream `connection.rs` opens (a TCP socket and
-# rustls). imap-proto for the response types it hands back.
-imap = { version = "3.0.0-alpha.15", default-features = false }
-imap-proto = "0.16"
-# TLS for IMAP and SMTP. ring is the crypto (aws-lc-rs would need cmake and a
-# musl C toolchain for the static Linux build), with the webpki roots bundled.
+# All email I/O runs on one tokio runtime (`connection::runtime`), off the
+# app's calls. IMAP is async-imap, over the stream `connection.rs` opens (a
+# tokio TCP socket and tokio-rustls).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# TLS for IMAP. ring is the crypto (aws-lc-rs would need cmake and a musl C
+# toolchain for the static Linux build), with the webpki roots bundled.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "1"
-# Building messages. SMTP itself is a few commands over `connection::open_tls`.
-lettre = { version = "0.11", default-features = false, features = ["builder"] }
+# SMTP: lettre's async transport on the same runtime, with rustls (ring) and
+# the webpki roots. STARTTLS for smtp://, implicit TLS for smtps://.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 base64 = "0.22"
 quoted_printable = "0.5"
+# The envelope cache. Bundled: SQLite is compiled from its C source into the
+# executable, so no platform needs a system library and the musl build stays
+# static.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # The HTTP to Google's OAuth endpoints. rustls (ring) with bundled roots, so
 # the static musl build needs no system TLS library.

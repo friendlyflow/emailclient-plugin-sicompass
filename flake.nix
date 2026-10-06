@@ -42,18 +42,29 @@
             extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
             targets = [ pluginTarget ];
           };
+          # A C compiler for musl, for the C the static Linux build compiles
+          # (SQLite, bundled into the envelope cache). The shell's own cc
+          # builds against glibc's headers, which leaves references to
+          # `open64` and `__memcpy_chk` that musl does not have.
+          muslCc = {
+            "x86_64-linux" = pkgs.pkgsCross.musl64.stdenv.cc;
+            "aarch64-linux" = pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc;
+          }.${system} or null;
+          ccVar = "CC_" + builtins.replaceStrings [ "-" ] [ "_" ] pluginTarget;
         in
         {
-          default = pkgs.mkShell {
+          default = pkgs.mkShell ({
             buildInputs = with pkgs; [
               rustToolchain
               # scripts/release-plugin.sh reads plugin.json with it.
               jq
-            ];
+            ] ++ pkgs.lib.optional (muslCc != null) muslCc;
             shellHook = ''
               export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library";
             '';
-          };
+          } // pkgs.lib.optionalAttrs (muslCc != null) {
+            ${ccVar} = "${muslCc}/bin/${muslCc.targetPrefix}cc";
+          });
         });
     };
 }

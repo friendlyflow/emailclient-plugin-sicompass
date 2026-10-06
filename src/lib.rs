@@ -5,7 +5,7 @@
 //! IMAP and SMTP operations are injected via the [`ImapBackend`] and
 //! [`SmtpBackend`] traits, making the provider fully unit-testable.
 //! Real network backends live in `net`, OAuth2 in `oauth2`, IDLE in `idle`,
-//! and the background thread that runs them in `worker`.
+//! and all of them run on one tokio runtime (`connection::runtime`).
 //!
 //! ## FFON tree layout
 //!
@@ -57,10 +57,14 @@ pub mod idle;
 mod localize;
 pub mod net;
 pub mod oauth2;
-mod worker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+// The plugin's calls are synchronous, so every `ImapBackend` / `SmtpBackend`
+// call on the synchronous path is bridged here. `block_on` detects an ambient
+// runtime and uses `block_in_place` rather than panicking.
+use crate::connection::block_on;
 
 use sicompass_sdk::ffon::{FfonElement, FfonObject};
 use sicompass_sdk::placeholders::{I_PLACEHOLDER, new_obj_with_i_placeholder, seed_i_placeholders};
@@ -87,36 +91,6 @@ pub enum MailBody {
 impl Default for MailBody {
     fn default() -> Self {
         MailBody::Text(String::new())
-    }
-}
-
-/// A body crosses to and from the worker as text, or as FFON's JSON.
-#[derive(serde::Serialize, serde::Deserialize)]
-enum MailBodyWire {
-    Text(String),
-    Ffon(String),
-}
-
-impl serde::Serialize for MailBody {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            MailBody::Text(t) => MailBodyWire::Text(t.clone()),
-            MailBody::Ffon(elems) => MailBodyWire::Ffon(
-                sicompass_sdk::ffon::to_json_string(elems).map_err(serde::ser::Error::custom)?,
-            ),
-        }
-        .serialize(s)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for MailBody {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(match MailBodyWire::deserialize(d)? {
-            MailBodyWire::Text(t) => MailBody::Text(t),
-            MailBodyWire::Ffon(json) => MailBody::Ffon(
-                sicompass_sdk::ffon::parse_json(&json).map_err(serde::de::Error::custom)?,
-            ),
-        })
     }
 }
 
@@ -162,7 +136,7 @@ pub(crate) fn flatten_ffon_to_text(elems: &[FfonElement]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Config mirroring `EmailClientConfig` from `emailclient.h`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct EmailClientConfig {
     pub imap_url: String,
     pub smtp_url: String,
@@ -176,7 +150,7 @@ pub struct EmailClientConfig {
 }
 
 /// A single mailbox entry returned by `ImapBackend::list_folders`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FolderInfo {
     /// Full IMAP folder name, e.g. `[Gmail]/Trash`.
     pub name: String,
@@ -199,7 +173,7 @@ struct SpecialFolders {
 }
 
 /// A summarised message header (from IMAP ENVELOPE + FLAGS).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MessageHeader {
     /// IMAP UID
     pub uid: u32,
@@ -220,32 +194,15 @@ pub struct MessageHeader {
 }
 
 /// A file attached to a received message.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EmailAttachment {
     pub filename: String,
     pub content_type: String,
-    /// Base64 on its way to and from the worker, not a JSON array of numbers.
-    #[serde(with = "base64_bytes")]
     pub data: Vec<u8>,
 }
 
-mod base64_bytes {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&STANDARD.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(d)?;
-        STANDARD.decode(text).map_err(serde::de::Error::custom)
-    }
-}
-
 /// A fully fetched email message.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EmailMessage {
     pub uid: u32,
     pub from: String,
@@ -299,21 +256,30 @@ struct ComposeState {
 // ---------------------------------------------------------------------------
 
 /// IMAP backend — all operations used by the provider.
+#[async_trait::async_trait]
 pub trait ImapBackend: Send {
     /// List all selectable folders with their SPECIAL-USE attributes.
-    fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String>;
+    async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String>;
     /// Fetch headers (including flags) for the most recent `limit` messages in `folder`.
-    fn list_messages(&mut self, folder: &str, limit: usize) -> Result<Vec<MessageHeader>, String>;
+    async fn list_messages(
+        &mut self,
+        folder: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageHeader>, String>;
     /// Fetch the full content of a message by UID.
-    fn fetch_message(&mut self, folder: &str, uid: u32) -> Result<Option<EmailMessage>, String>;
+    async fn fetch_message(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<EmailMessage>, String>;
     /// Fetch a message by its Message-ID header via IMAP SEARCH.
-    fn fetch_message_by_message_id(
+    async fn fetch_message_by_message_id(
         &mut self,
         folder: &str,
         message_id: &str,
     ) -> Result<Option<EmailMessage>, String>;
     /// Add/remove IMAP flags on a message (e.g. `\\Seen`, `\\Flagged`, `\\Deleted`).
-    fn set_flags(
+    async fn set_flags(
         &mut self,
         folder: &str,
         uid: u32,
@@ -321,27 +287,28 @@ pub trait ImapBackend: Send {
         remove: &[&str],
     ) -> Result<(), String>;
     /// Copy a message to another folder (server-side COPY).
-    fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
+    async fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
     /// Move a message to another folder (MOVE extension; falls back to COPY+DELETE+EXPUNGE).
-    fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
+    async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String>;
     /// Expunge a specific UID from a folder (UIDPLUS UID EXPUNGE).
-    fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String>;
+    async fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String>;
     /// Append a raw RFC 2822 message to a folder (IMAP APPEND).
-    fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String>;
+    async fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String>;
     /// Fetch the UID thread map for `folder` using the IMAP THREAD extension.
     ///
     /// Returns `Some(threads)` where each inner `Vec<u32>` is the flat list of
     /// UIDs belonging to the same thread.  Returns `None` when the server does
     /// not advertise `THREAD=REFERENCES` capability.
-    fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String>;
+    async fn fetch_threads(&mut self, folder: &str) -> Result<Option<Vec<Vec<u32>>>, String>;
 }
 
 /// SMTP backend — send an email message.
 /// Returns the raw RFC 2822 bytes of the sent message (for IMAP APPEND to Sent).
+#[async_trait::async_trait]
 pub trait SmtpBackend: Send {
     // One argument per part of the message, as the compose form has them.
     #[allow(clippy::too_many_arguments)]
-    fn send(
+    async fn send(
         &mut self,
         from: &str,
         to: &[&str],
@@ -549,21 +516,23 @@ pub struct EmailClientProvider {
 
     // ---- Non-blocking IMAP operations ------------------------------------
     //
-    // `Provider` is synchronous, so anything run inline blocks the render
-    // thread: SDL events go unpolled, AT-SPI goes unserviced, and a screen
-    // reader drops focus tracking on the window (see the `LONG_FRAME_MS`
-    // workaround in the app's `view.rs`). These fields move the operations
-    // that actually touch the network onto the shared email runtime, using
-    // the same inflight + result-slot + `needs_refresh_flag` handshake the
-    // folder fetch already proved out.
+    // The app waits for every call, drawing nothing meanwhile, so anything
+    // run inline freezes the window: SDL events go unpolled, AT-SPI goes
+    // unserviced, and a screen reader drops focus tracking on it. These
+    // fields move the operations that actually touch the network onto the
+    // shared email runtime (`connection::runtime`), using the same inflight +
+    // result-slot + `bg_completed` handshake the folder fetch already proved
+    // out.
     //
     // One connection behind an async mutex, reused across operations. IMAP is
     // strictly one command at a time per connection anyway, and reconnecting
     // per operation would cost a TCP + TLS + login round-trip on every message
-    // open — worse than the blocking this replaces. The render thread never
-    // touches it; only spawned tasks do.
-    /// The background worker (see `worker.rs`), started on first use.
-    worker: Option<worker::Worker>,
+    // open. A call from the app never touches it; only spawned tasks do.
+    bg_imap: Option<Arc<tokio::sync::Mutex<crate::net::RealImap>>>,
+
+    // Background tasks that panicked, by kind, until `tick` releases what was
+    // waiting on them (see `spawn_bg`).
+    bg_panics: Arc<Mutex<Vec<BgKind>>>,
 
     // Message body fetch (opening a message).
     message_fetch_inflight: Arc<AtomicBool>,
@@ -660,7 +629,7 @@ pub struct EmailClientProvider {
 }
 
 /// One entry in the History view: either already known, or a fetch to make.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) enum HistoryItem {
     Label(String),
     FetchUid(u32),
@@ -678,7 +647,94 @@ enum MessageState {
     Missing,
 }
 
-use worker::BgOp;
+/// A mutation dispatched to the background runtime.
+///
+/// Modelled as data rather than a closure so the spawn site stays one function
+/// and each variant carries owned arguments across the task boundary.
+#[derive(Debug, Clone)]
+enum BgOp {
+    SetFlags {
+        folder: String,
+        uid: u32,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    Move {
+        folder: String,
+        uid: u32,
+        dest: String,
+    },
+    Expunge {
+        folder: String,
+        uid: u32,
+    },
+    Append {
+        folder: String,
+        message: Vec<u8>,
+    },
+    /// Find the message with `msg_id` in `search_in` and move it to `dest`
+    /// (an undo or redo of a trash, archive or move).
+    MoveByMessageId {
+        search_in: String,
+        msg_id: String,
+        dest: String,
+    },
+}
+
+impl BgOp {
+    /// Prefix for the user-facing error when the operation fails.
+    fn label(&self) -> &'static str {
+        match self {
+            BgOp::SetFlags { .. } => "flag update failed",
+            BgOp::Move { .. } => "move failed",
+            BgOp::Expunge { .. } => "delete failed",
+            BgOp::Append { .. } => "save failed",
+            BgOp::MoveByMessageId { .. } => "move failed",
+        }
+    }
+
+    /// Carry the operation out on `imap`.
+    async fn run(&self, imap: &mut crate::net::RealImap) -> Result<(), String> {
+        match self {
+            BgOp::SetFlags {
+                folder,
+                uid,
+                add,
+                remove,
+            } => {
+                let add_refs: Vec<&str> = add.iter().map(String::as_str).collect();
+                let remove_refs: Vec<&str> = remove.iter().map(String::as_str).collect();
+                imap.set_flags(folder, *uid, &add_refs, &remove_refs).await
+            }
+            BgOp::Move { folder, uid, dest } => imap.move_message(folder, *uid, dest).await,
+            BgOp::Expunge { folder, uid } => imap.expunge_uid(folder, *uid).await,
+            BgOp::Append { folder, message } => imap.append(folder, message).await,
+            BgOp::MoveByMessageId {
+                search_in,
+                msg_id,
+                dest,
+            } => match imap.fetch_message_by_message_id(search_in, msg_id).await {
+                Ok(Some(msg)) => imap.move_message(search_in, msg.uid, dest).await,
+                Ok(None) => Err(format!("the message is no longer in {search_in}")),
+                Err(e) => Err(e),
+            },
+        }
+    }
+}
+
+/// What a background task was doing, so a panic in it releases whatever was
+/// waiting on it (see [`EmailClientProvider::spawn_bg`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BgKind {
+    Root,
+    Envelopes,
+    Threads,
+    Message,
+    History,
+    Op,
+    Send,
+    Token,
+}
 
 impl EmailClientProvider {
     pub fn new() -> Self {
@@ -710,7 +766,8 @@ impl EmailClientProvider {
             folder_fetch_result: Arc::new(Mutex::new(None)),
             async_folder_fetch_enabled: true,
             inbox_prefetch_result: Arc::new(Mutex::new(None)),
-            worker: None,
+            bg_imap: None,
+            bg_panics: Arc::new(Mutex::new(Vec::new())),
             message_fetch_inflight: Arc::new(AtomicBool::new(false)),
             message_fetch_result: Arc::new(Mutex::new(None)),
             message_fetch_key: None,
@@ -740,117 +797,69 @@ impl EmailClientProvider {
 
     // ---- Non-blocking IMAP plumbing -----------------------------------------
 
-    /// Hand `job` to the worker, starting it on first use. A worker that
-    /// cannot start reports why, the way a failed job would.
-    fn send_to_worker(&mut self, job: worker::Job) {
-        if self.worker.is_none() {
-            match worker::Worker::start(&self.config) {
-                Ok(w) => self.worker = Some(w),
-                Err(e) => {
-                    self.bg_errors
-                        .lock()
-                        .unwrap()
-                        .push(format!("IMAP error: {e}"));
-                    self.bg_completed.store(true, Ordering::Release);
-                    return;
-                }
-            }
+    /// The shared background connection, opened on first use.
+    fn bg_imap(&mut self) -> Arc<tokio::sync::Mutex<crate::net::RealImap>> {
+        if self.bg_imap.is_none() {
+            self.bg_imap = Some(Arc::new(tokio::sync::Mutex::new(
+                crate::net::RealImap::from_config(&self.config),
+            )));
         }
-        if let Some(w) = &self.worker
-            && let Err(e) = w.send(&job)
-        {
-            self.worker = None;
-            self.bg_errors
-                .lock()
-                .unwrap()
-                .push(format!("IMAP error: {e}"));
-            self.bg_completed.store(true, Ordering::Release);
-        }
+        Arc::clone(self.bg_imap.as_ref().expect("opened above"))
     }
 
-    /// Put what the worker finished where the rendering code looks for it,
-    /// and ask for a render.
-    fn apply_done(&mut self, done: worker::Done) {
-        use worker::Done;
-        match done {
-            Done::Root { folders, inbox } => {
-                *self.folder_fetch_result.lock().unwrap() = Some(folders);
-                *self.inbox_prefetch_result.lock().unwrap() = Some(inbox);
-                // Clear inflight before raising the refresh flag, so the render
-                // cannot observe "done but still in flight".
-                self.folder_fetch_inflight.store(false, Ordering::Release);
+    /// Run `task` on the email runtime.
+    ///
+    /// A task that panics would leave its inflight flag and key set for good
+    /// ("Loading…" forever, and the work never started again), so the panic
+    /// is caught and reported as `kind`; `tick` then releases what was
+    /// waiting on it.
+    fn spawn_bg<F>(&self, kind: BgKind, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use futures::FutureExt;
+        let panics = Arc::clone(&self.bg_panics);
+        let bg_done = Arc::clone(&self.bg_completed);
+        crate::connection::runtime().spawn(async move {
+            if std::panic::AssertUnwindSafe(task)
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                panics.lock().unwrap().push(kind);
+                bg_done.store(true, Ordering::Release);
             }
-            Done::Envelopes {
-                folder,
-                limit,
-                result,
-            } => *self.envelope_fetch_result.lock().unwrap() = Some((folder, limit, result)),
-            Done::Threads { folder, threads } => {
-                *self.thread_fetch_result.lock().unwrap() = Some((folder, threads))
-            }
-            Done::Message {
-                folder,
-                uid,
-                result,
-            } => {
-                *self.message_fetch_result.lock().unwrap() = Some((folder, uid, result));
-                self.message_fetch_inflight.store(false, Ordering::Release);
-            }
-            Done::History { key, labels } => {
-                *self.history_fetch_result.lock().unwrap() = Some((key, labels))
-            }
-            Done::Op { label, error } => {
-                // Re-render either way: on success the optimistic local state
-                // is confirmed, on failure the error needs to reach the user.
-                if let Some(e) = error {
-                    self.bg_errors.lock().unwrap().push(format!("{label}: {e}"));
-                }
-            }
-            Done::Sent { result } => {
-                *self.send_result.lock().unwrap() = Some(result);
-                self.send_inflight.store(false, Ordering::Release);
-            }
-            Done::Token { result } => {
-                *self.token_refresh_result.lock().unwrap() = Some(result);
-                self.token_refresh_inflight.store(false, Ordering::Release);
-            }
-        }
-        self.bg_completed.store(true, Ordering::Release);
+        });
     }
 
-    /// Apply what the worker finished, and notice a worker that has ended.
-    fn drain_worker(&mut self) {
-        let Some(worker) = &self.worker else {
+    /// Release what was waiting on background tasks that panicked: their
+    /// results are not coming, so nothing may wait on them.
+    fn release_panicked_tasks(&mut self) {
+        let kinds = std::mem::take(&mut *self.bg_panics.lock().unwrap());
+        if kinds.is_empty() {
             return;
-        };
-        match worker.drain() {
-            Ok(done) => {
-                for d in done {
-                    self.apply_done(d);
+        }
+        for kind in kinds {
+            match kind {
+                BgKind::Root => self.folder_fetch_inflight.store(false, Ordering::Release),
+                BgKind::Envelopes => self.envelope_fetch_key = None,
+                BgKind::Threads => self.thread_fetch_key = None,
+                BgKind::Message => {
+                    self.message_fetch_inflight.store(false, Ordering::Release);
+                    self.message_fetch_key = None;
                 }
-            }
-            Err((done, e)) => {
-                for d in done {
-                    self.apply_done(d);
-                }
-                self.worker_ended(e);
+                BgKind::History => self.history_fetch_key = None,
+                BgKind::Op => {}
+                BgKind::Send => self.send_inflight.store(false, Ordering::Release),
+                BgKind::Token => self.token_refresh_inflight.store(false, Ordering::Release),
             }
         }
-    }
-
-    /// The worker is gone; the next job starts another. Whatever it had in
-    /// flight is not coming, so nothing may wait on it.
-    fn worker_ended(&mut self, error: String) {
-        self.worker = None;
-        self.folder_fetch_inflight.store(false, Ordering::Release);
-        self.message_fetch_inflight.store(false, Ordering::Release);
-        self.send_inflight.store(false, Ordering::Release);
-        self.token_refresh_inflight.store(false, Ordering::Release);
-        self.message_fetch_key = None;
-        self.envelope_fetch_key = None;
-        self.thread_fetch_key = None;
-        self.history_fetch_key = None;
-        self.bg_errors.lock().unwrap().push(error);
+        // The shared connection may have been left in the middle of a command.
+        self.bg_imap = None;
+        self.bg_errors
+            .lock()
+            .unwrap()
+            .push("the email client's background work stopped unexpectedly".to_owned());
         self.bg_completed.store(true, Ordering::Release);
     }
 
@@ -860,10 +869,7 @@ impl EmailClientProvider {
     /// config change — since the open connection authenticated with the old
     /// credentials.
     fn reset_bg_imap(&mut self) {
-        if self.worker.is_some() {
-            let config = self.config.clone();
-            self.send_to_worker(worker::Job::Configure(config));
-        }
+        self.bg_imap = None;
     }
 
     /// Whether IMAP work should run in the background.
@@ -876,9 +882,24 @@ impl EmailClientProvider {
         self.async_folder_fetch_enabled
     }
 
-    /// Hand a write to the worker, recording any error for `take_error`.
+    /// Run `op` on the shared runtime, recording any error for `take_error`.
     fn spawn_bg_op(&mut self, op: BgOp) {
-        self.send_to_worker(worker::Job::Op(op));
+        let imap = self.bg_imap();
+        let errors = Arc::clone(&self.bg_errors);
+        let bg_done = Arc::clone(&self.bg_completed);
+
+        self.spawn_bg(BgKind::Op, async move {
+            let result = {
+                let mut guard = imap.lock().await;
+                op.run(&mut guard).await
+            };
+            if let Err(e) = result {
+                errors.lock().unwrap().push(format!("{}: {e}", op.label()));
+            }
+            // Re-render either way: on success the optimistic local state is
+            // confirmed, on failure the error needs to reach the user.
+            bg_done.store(true, Ordering::Release);
+        });
     }
 
     /// Resolve the body for `(folder, uid)`, fetching in the background.
@@ -890,7 +911,7 @@ impl EmailClientProvider {
     fn resolve_message(&mut self, real_folder: &str, uid: u32) -> MessageState {
         if !self.bg_enabled() {
             if let Some(ref mut imap) = self.imap
-                && let Ok(Some(m)) = imap.fetch_message(real_folder, uid)
+                && let Ok(Some(m)) = block_on(imap.fetch_message(real_folder, uid))
             {
                 self.message_detail = Some(m.clone());
                 self.message_detail_folder = real_folder.to_owned();
@@ -982,10 +1003,20 @@ impl EmailClientProvider {
 
     /// Fetch a folder's envelope list in the background.
     fn spawn_envelope_fetch(&mut self, folder: &str, limit: usize) {
-        self.envelope_fetch_key = Some((folder.to_owned(), limit));
-        self.send_to_worker(worker::Job::Envelopes {
-            folder: folder.to_owned(),
-            limit,
+        let imap = self.bg_imap();
+        let slot = Arc::clone(&self.envelope_fetch_result);
+        let bg_done = Arc::clone(&self.bg_completed);
+        let folder_owned = folder.to_owned();
+
+        self.envelope_fetch_key = Some((folder_owned.clone(), limit));
+
+        self.spawn_bg(BgKind::Envelopes, async move {
+            let result = {
+                let mut guard = imap.lock().await;
+                guard.list_messages(&folder_owned, limit).await
+            };
+            *slot.lock().unwrap() = Some((folder_owned, limit, result));
+            bg_done.store(true, Ordering::Release);
         });
     }
 
@@ -994,19 +1025,44 @@ impl EmailClientProvider {
     /// Nothing waits on this: until it lands, History uses the References
     /// fallback, exactly as it does against a server with no THREAD support.
     fn spawn_thread_fetch(&mut self, folder: &str) {
-        self.thread_fetch_key = Some(folder.to_owned());
-        self.send_to_worker(worker::Job::Threads {
-            folder: folder.to_owned(),
+        let imap = self.bg_imap();
+        let slot = Arc::clone(&self.thread_fetch_result);
+        let bg_done = Arc::clone(&self.bg_completed);
+        let folder_owned = folder.to_owned();
+
+        self.thread_fetch_key = Some(folder_owned.clone());
+
+        self.spawn_bg(BgKind::Threads, async move {
+            let result = {
+                let mut guard = imap.lock().await;
+                guard.fetch_threads(&folder_owned).await
+            };
+            // A THREAD failure is non-fatal and already covered by the
+            // References path, so it is recorded as "no map", not an error.
+            *slot.lock().unwrap() = Some((folder_owned, result.ok().flatten()));
+            bg_done.store(true, Ordering::Release);
         });
     }
 
     /// Fetch a message body in the background.
     fn spawn_message_fetch(&mut self, folder: &str, uid: u32) {
-        self.message_fetch_key = Some((folder.to_owned(), uid));
-        self.message_fetch_inflight.store(true, Ordering::Release);
-        self.send_to_worker(worker::Job::Message {
-            folder: folder.to_owned(),
-            uid,
+        let imap = self.bg_imap();
+        let slot = Arc::clone(&self.message_fetch_result);
+        let inflight = Arc::clone(&self.message_fetch_inflight);
+        let bg_done = Arc::clone(&self.bg_completed);
+        let folder_owned = folder.to_owned();
+
+        self.message_fetch_key = Some((folder_owned.clone(), uid));
+        inflight.store(true, Ordering::Release);
+
+        self.spawn_bg(BgKind::Message, async move {
+            let result = {
+                let mut guard = imap.lock().await;
+                guard.fetch_message(&folder_owned, uid).await
+            };
+            *slot.lock().unwrap() = Some((folder_owned, uid, result));
+            inflight.store(false, Ordering::Release);
+            bg_done.store(true, Ordering::Release);
         });
     }
 
@@ -1156,9 +1212,9 @@ impl EmailClientProvider {
                 } else {
                     (src_folder.as_str(), trash_folder.as_str())
                 };
-                match imap.fetch_message_by_message_id(search_in, msg_id) {
+                match block_on(imap.fetch_message_by_message_id(search_in, msg_id)) {
                     Ok(Some(msg)) => {
-                        if let Err(e) = imap.move_message(search_in, msg.uid, move_to) {
+                        if let Err(e) = block_on(imap.move_message(search_in, msg.uid, move_to)) {
                             let mut args = localize::Args::new();
                             args.set("label", label.to_owned());
                             args.set("err", e.to_string());
@@ -1194,7 +1250,7 @@ impl EmailClientProvider {
                 } else {
                     (&[], &["\\Seen"])
                 };
-                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove) {
+                if let Err(e) = block_on(imap.set_flags(folder, *msg_uid, add, remove)) {
                     let mut args = localize::Args::new();
                     args.set("label", label.to_owned());
                     args.set("err", e.to_string());
@@ -1218,7 +1274,7 @@ impl EmailClientProvider {
                 } else {
                     (&[], &["\\Flagged"])
                 };
-                if let Err(e) = imap.set_flags(folder, *msg_uid, add, remove) {
+                if let Err(e) = block_on(imap.set_flags(folder, *msg_uid, add, remove)) {
                     let mut args = localize::Args::new();
                     args.set("label", label.to_owned());
                     args.set("err", e.to_string());
@@ -1233,7 +1289,7 @@ impl EmailClientProvider {
         }
     }
 
-    /// `apply_imap_op` through the worker: the local state changes at once,
+    /// `apply_imap_op` in the background: the local state changes at once,
     /// the server follows, and a failure is reported like any other write's.
     fn apply_imap_op_in_background(&mut self, op: &ImapOpKind, is_undo: bool) {
         match op {
@@ -1570,10 +1626,39 @@ impl EmailClientProvider {
         items
     }
 
-    /// Fetch the folder list, with INBOX's latest messages alongside it.
+    /// Fetch the folder list and prefetch INBOX at the same time.
+    ///
+    /// Two separate `RealImap` values on purpose: IMAP `SELECT` is
+    /// connection-global, so listing folders and listing INBOX messages over one
+    /// session would race on which mailbox is selected. The win here is
+    /// genuine concurrency, not connection reuse.
     fn spawn_root_fetch(&mut self) {
         self.folder_fetch_inflight.store(true, Ordering::Release);
-        self.send_to_worker(worker::Job::Root);
+        let inflight = Arc::clone(&self.folder_fetch_inflight);
+        let folder_slot = Arc::clone(&self.folder_fetch_result);
+        let inbox_slot = Arc::clone(&self.inbox_prefetch_result);
+        let bg_done = Arc::clone(&self.bg_completed);
+        let config = self.config.clone();
+
+        self.spawn_bg(BgKind::Root, async move {
+            let mut folder_imap = crate::net::RealImap::from_config(&config);
+            let mut inbox_imap = crate::net::RealImap::from_config(&config);
+
+            // `join!` rather than `try_join!`: a failed folder list must not
+            // discard a good INBOX prefetch, and each slot carries its own
+            // `Result` for the drain logic to report.
+            let (folders, inbox) = tokio::join!(
+                folder_imap.list_folders(),
+                inbox_imap.list_messages("INBOX", 50),
+            );
+
+            *folder_slot.lock().unwrap() = Some(folders);
+            *inbox_slot.lock().unwrap() = Some(inbox);
+            // Clear inflight before raising the refresh flag, so the app
+            // cannot observe "done but still in flight".
+            inflight.store(false, Ordering::Release);
+            bg_done.store(true, Ordering::Release);
+        });
     }
 
     fn build_root(&mut self) -> Vec<FfonElement> {
@@ -1630,7 +1715,7 @@ impl EmailClientProvider {
             }
         };
 
-        let folder_result = imap.list_folders();
+        let folder_result = block_on(imap.list_folders());
         self.build_root_from_folder_list(folder_result)
     }
 
@@ -1700,7 +1785,7 @@ impl EmailClientProvider {
                     return items;
                 }
             };
-            imap.list_messages(&real_folder, limit)
+            block_on(imap.list_messages(&real_folder, limit))
         };
 
         match folder_result {
@@ -1742,7 +1827,7 @@ impl EmailClientProvider {
                     self.spawn_thread_fetch(&real_folder);
                 }
             } else if let Some(imap) = self.imap.as_mut()
-                && let Ok(Some(threads)) = imap.fetch_threads(&real_folder)
+                && let Ok(Some(threads)) = block_on(imap.fetch_threads(&real_folder))
             {
                 let mut uid_to_thread: std::collections::HashMap<u32, Vec<u32>> =
                     std::collections::HashMap::new();
@@ -1804,7 +1889,7 @@ impl EmailClientProvider {
                 self.envelopes_changed();
             } else {
                 let marked = if let Some(ref mut imap) = self.imap {
-                    (imap.set_flags(&real_folder, uid, &["\\Seen"], &[])).is_ok()
+                    block_on(imap.set_flags(&real_folder, uid, &["\\Seen"], &[])).is_ok()
                 } else {
                     false
                 };
@@ -1918,8 +2003,41 @@ impl EmailClientProvider {
     /// Resolve the History view's outstanding fetches in the background.
     fn spawn_history_fetch(&mut self, key: String) {
         let (plan, folders) = self.history_plan();
+        let imap = self.bg_imap();
+        let slot = Arc::clone(&self.history_fetch_result);
+        let bg_done = Arc::clone(&self.bg_completed);
+
         self.history_fetch_key = Some(key.clone());
-        self.send_to_worker(worker::Job::History { key, plan, folders });
+
+        self.spawn_bg(BgKind::History, async move {
+            let mut labels = Vec::new();
+            let mut guard = imap.lock().await;
+            for item in plan {
+                match item {
+                    HistoryItem::Label(l) => labels.push(l),
+                    HistoryItem::FetchUid(uid) => {
+                        let folder = folders.first().cloned().unwrap_or_default();
+                        if let Ok(Some(msg)) = guard.fetch_message(&folder, uid).await {
+                            labels.push(format!("From: {} — Subject: {}", msg.from, msg.subject));
+                        }
+                    }
+                    HistoryItem::FetchMessageId(msg_id) => {
+                        for folder in &folders {
+                            if let Ok(Some(msg)) =
+                                guard.fetch_message_by_message_id(folder, &msg_id).await
+                            {
+                                labels
+                                    .push(format!("From: {} — Subject: {}", msg.from, msg.subject));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            drop(guard);
+            *slot.lock().unwrap() = Some((key, labels));
+            bg_done.store(true, Ordering::Release);
+        });
     }
 
     fn build_history(&mut self) -> Vec<FfonElement> {
@@ -1995,7 +2113,7 @@ impl EmailClientProvider {
                     } else if let Some(ref mut imap) = self.imap {
                         // Not in the current-folder cache — fetch by UID.
                         let uid_str = other_uid.to_string();
-                        if let Ok(Some(msg)) = imap.fetch_message(&folder, other_uid) {
+                        if let Ok(Some(msg)) = block_on(imap.fetch_message(&folder, other_uid)) {
                             let _ = uid_str;
                             items.push(FfonElement::new_obj(format!(
                                 "From: {} — Subject: {}",
@@ -2048,7 +2166,8 @@ impl EmailClientProvider {
 
             'search: for search_folder in &search_folders {
                 if let Some(ref mut imap) = self.imap
-                    && let Ok(Some(msg)) = imap.fetch_message_by_message_id(search_folder, msg_id)
+                    && let Ok(Some(msg)) =
+                        block_on(imap.fetch_message_by_message_id(search_folder, msg_id))
                 {
                     let key = format!("From: {} — Subject: {}", msg.from, msg.subject);
                     items.push(FfonElement::new_obj(key));
@@ -2096,7 +2215,7 @@ impl EmailClientProvider {
                 }
             } else {
                 if let Some(ref mut imap) = self.imap
-                    && let Ok(Some(msg)) = imap.fetch_message(&folder, uid)
+                    && let Ok(Some(msg)) = block_on(imap.fetch_message(&folder, uid))
                 {
                     prefill_compose(&mut self.compose, &msg, mode, &username);
                 }
@@ -2217,7 +2336,7 @@ impl EmailClientProvider {
             .map(|(n, b)| (n.as_str(), b.as_slice()))
             .collect();
 
-        let raw = (smtp.send(
+        let raw = block_on(smtp.send(
             &from,
             &to_r,
             &cc_r,
@@ -2236,7 +2355,7 @@ impl EmailClientProvider {
                     message: raw.clone(),
                 });
             } else if let Some(ref mut imap) = self.imap {
-                let _ = imap.append(&sent, &raw);
+                let _ = block_on(imap.append(&sent, &raw));
             }
         }
         Ok(())
@@ -2258,7 +2377,7 @@ impl EmailClientProvider {
         let bcc_v = Self::split_addrs(&draft.bcc);
         let subject = draft.subject.clone();
         let body = normalize_body_for_send(&draft.body);
-        // Read attachments here, on the render thread: it is local file I/O,
+        // Read attachments here, in the call: it is local file I/O,
         // and doing it in the task would need the paths to outlive the draft.
         let attachment_data: Vec<(String, Vec<u8>)> = draft
             .attachments
@@ -2273,19 +2392,37 @@ impl EmailClientProvider {
             })
             .collect();
 
-        self.send_inflight.store(true, Ordering::Release);
+        let slot = Arc::clone(&self.send_result);
+        let inflight = Arc::clone(&self.send_inflight);
+        let bg_done = Arc::clone(&self.bg_completed);
+        inflight.store(true, Ordering::Release);
         self.pending_send_draft = Some(draft);
-        // The token may just have been refreshed: the worker sends with the
-        // settings it is handed here.
-        self.send_to_worker(worker::Job::Configure(config));
-        self.send_to_worker(worker::Job::Send {
-            from,
-            to: to_v,
-            cc: cc_v,
-            bcc: bcc_v,
-            subject,
-            body,
-            attachments: attachment_data,
+
+        // A fresh transport with the settings as they are now: the token may
+        // just have been refreshed.
+        self.spawn_bg(BgKind::Send, async move {
+            let mut smtp = crate::net::RealSmtp::from_config(&config);
+            let to_r: Vec<&str> = to_v.iter().map(String::as_str).collect();
+            let cc_r: Vec<&str> = cc_v.iter().map(String::as_str).collect();
+            let bcc_r: Vec<&str> = bcc_v.iter().map(String::as_str).collect();
+            let attachment_refs: Vec<(&str, &[u8])> = attachment_data
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            let result = smtp
+                .send(
+                    &from,
+                    &to_r,
+                    &cc_r,
+                    &bcc_r,
+                    &subject,
+                    &body,
+                    &attachment_refs,
+                )
+                .await;
+            *slot.lock().unwrap() = Some(result);
+            inflight.store(false, Ordering::Release);
+            bg_done.store(true, Ordering::Release);
         });
         true
     }
@@ -2417,12 +2554,36 @@ impl EmailClientProvider {
             return false;
         }
 
-        // Hand the refresh to the worker.
+        // Spawn a background refresh.
         self.token_refresh_inflight.store(true, Ordering::Release);
-        self.send_to_worker(worker::Job::RefreshToken {
-            client_id: self.config.client_id.clone(),
-            client_secret: self.config.client_secret.clone(),
-            refresh_token: self.config.oauth_refresh_token.clone(),
+        let inflight = Arc::clone(&self.token_refresh_inflight);
+        let result_slot = Arc::clone(&self.token_refresh_result);
+        let bg_done = Arc::clone(&self.bg_completed);
+        let client_id = self.config.client_id.clone();
+        let client_secret = self.config.client_secret.clone();
+        let refresh_token_str = self.config.oauth_refresh_token.clone();
+        // `oauth2::refresh_token` is blocking HTTP (ureq) and is not IMAP, so
+        // it goes on the runtime's blocking pool rather than being rewritten
+        // async.
+        self.spawn_bg(BgKind::Token, async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let r = oauth2::refresh_token(&client_id, &client_secret, &refresh_token_str);
+                if r.success {
+                    Ok((r.access_token, oauth2::now_secs() + r.expires_in))
+                } else {
+                    Err("OAuth token refresh failed".to_owned())
+                }
+            })
+            .await;
+            // A panic on the blocking pool comes back as an error here; pass
+            // it on so `spawn_bg` reports it like any other task's.
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            };
+            *result_slot.lock().unwrap() = Some(outcome);
+            inflight.store(false, Ordering::Release);
+            bg_done.store(true, Ordering::Release);
         });
         false
     }
@@ -3087,7 +3248,7 @@ impl EmailClientProvider {
     }
 
     pub fn fetch(&mut self) -> Vec<FfonElement> {
-        self.drain_worker();
+        self.release_panicked_tasks();
         if !self.ensure_fresh_token_async() {
             return vec![FfonElement::new_str("Loading…".to_owned())];
         }
@@ -3204,7 +3365,7 @@ impl EmailClientProvider {
                         message: bytes,
                     });
                 } else if let Some(ref mut imap) = self.imap {
-                    let _ = imap.append(&drafts_folder, &bytes);
+                    let _ = block_on(imap.append(&drafts_folder, &bytes));
                 }
             }
         }
@@ -3326,7 +3487,7 @@ impl EmailClientProvider {
                                     message: bytes,
                                 });
                             } else if let Some(ref mut imap) = self.imap {
-                                let _ = imap.append(&drafts_folder, &bytes);
+                                let _ = block_on(imap.append(&drafts_folder, &bytes));
                             }
                         }
                         self.outbox_pending = true;
@@ -3359,7 +3520,7 @@ impl EmailClientProvider {
     }
 
     pub fn tick(&mut self) -> bool {
-        self.drain_worker();
+        self.release_panicked_tasks();
         // A background fetch or mutation finished: re-render, but leave the
         // caches alone — the result has already been folded in.
         let mut needs_refresh = self.bg_completed.swap(false, Ordering::AcqRel);
@@ -3625,7 +3786,7 @@ impl EmailClientProvider {
                 dest: dest.to_owned(),
             });
         } else if let Some(ref mut imap) = self.imap
-            && let Err(e) = imap.move_message(&from, uid, &dest)
+            && let Err(e) = block_on(imap.move_message(&from, uid, &dest))
         {
             self.error_message = Some(format!("move failed: {e}"));
             return false;
@@ -3717,7 +3878,7 @@ impl EmailClientProvider {
                             remove: remove.iter().map(|s| (*s).to_owned()).collect(),
                         });
                     } else if let Some(ref mut imap) = self.imap
-                        && let Err(e) = imap.set_flags(&real_folder, uid, add, remove)
+                        && let Err(e) = block_on(imap.set_flags(&real_folder, uid, add, remove))
                     {
                         let mut args = localize::Args::new();
                         args.set("cmd", cmd.to_owned());
@@ -3793,7 +3954,7 @@ impl EmailClientProvider {
                                     dest: t.clone(),
                                 });
                             } else if let Some(ref mut imap) = self.imap
-                                && let Err(e) = imap.move_message(&real_folder, uid, t)
+                                && let Err(e) = block_on(imap.move_message(&real_folder, uid, t))
                             {
                                 let mut args = localize::Args::new();
                                 args.set("err", e.to_string());
@@ -3829,8 +3990,9 @@ impl EmailClientProvider {
                                 uid,
                             });
                         } else if let Some(ref mut imap) = self.imap {
-                            let _ = imap.set_flags(&real_folder, uid, &["\\Deleted"], &[]);
-                            let _ = imap.expunge_uid(&real_folder, uid);
+                            let _ =
+                                block_on(imap.set_flags(&real_folder, uid, &["\\Deleted"], &[]));
+                            let _ = block_on(imap.expunge_uid(&real_folder, uid));
                         }
                     }
                     self.message_cache.retain(|h| h.uid != uid);
@@ -3868,7 +4030,7 @@ impl EmailClientProvider {
                                     dest: dest.clone(),
                                 });
                             } else if let Some(ref mut imap) = self.imap
-                                && let Err(e) = imap.move_message(&real_folder, uid, dest)
+                                && let Err(e) = block_on(imap.move_message(&real_folder, uid, dest))
                             {
                                 let mut args = localize::Args::new();
                                 args.set("err", e.to_string());
@@ -4044,15 +4206,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ImapBackend for MockImap {
-        fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
+        async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, String> {
             self.list_folders_calls += 1;
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             Ok(self.folders.clone())
         }
-        fn list_messages(
+        async fn list_messages(
             &mut self,
             _folder: &str,
             _limit: usize,
@@ -4063,7 +4226,7 @@ mod tests {
             }
             Ok(self.messages.clone())
         }
-        fn fetch_message(
+        async fn fetch_message(
             &mut self,
             _folder: &str,
             _uid: u32,
@@ -4073,7 +4236,7 @@ mod tests {
             }
             Ok(self.detail.clone())
         }
-        fn fetch_message_by_message_id(
+        async fn fetch_message_by_message_id(
             &mut self,
             folder: &str,
             _msg_id: &str,
@@ -4089,7 +4252,7 @@ mod tests {
             }
             Ok(self.by_msg_id.clone())
         }
-        fn set_flags(
+        async fn set_flags(
             &mut self,
             folder: &str,
             uid: u32,
@@ -4118,35 +4281,35 @@ mod tests {
             }
             Ok(())
         }
-        fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        async fn copy_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.moved.push((folder.to_owned(), uid, dest.to_owned()));
             Ok(())
         }
-        fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
+        async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.moved.push((folder.to_owned(), uid, dest.to_owned()));
             Ok(())
         }
-        fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        async fn expunge_uid(&mut self, folder: &str, uid: u32) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.expunged.push((folder.to_owned(), uid));
             Ok(())
         }
-        fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
+        async fn append(&mut self, folder: &str, message: &[u8]) -> Result<(), String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
             self.appended.push((folder.to_owned(), message.to_vec()));
             Ok(())
         }
-        fn fetch_threads(&mut self, _folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
+        async fn fetch_threads(&mut self, _folder: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
             if let Some(ref e) = self.error {
                 return Err(e.clone());
             }
@@ -4184,8 +4347,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SmtpBackend for MockSmtp {
-        fn send(
+        async fn send(
             &mut self,
             from: &str,
             to: &[&str],
@@ -4659,11 +4823,13 @@ mod tests {
         );
     }
 
-    /// A worker thread that ended (a panic in a job) answers nothing more,
-    /// so every slot waiting on it is released and the user is told.
+    /// A background task that panicked answers nothing, so every slot waiting
+    /// on it is released and the user is told.
     #[test]
-    fn a_worker_that_ended_releases_everything_waiting_on_it() {
+    fn a_task_that_panicked_releases_everything_waiting_on_it() {
         let mut p = EmailClientProvider::new();
+        p.config.imap_url = "imaps://imap.example.com".to_owned();
+        let _ = p.bg_imap();
         p.folder_fetch_inflight.store(true, Ordering::Release);
         p.message_fetch_inflight.store(true, Ordering::Release);
         p.send_inflight.store(true, Ordering::Release);
@@ -4673,9 +4839,31 @@ mod tests {
         p.thread_fetch_key = Some("INBOX".to_owned());
         p.history_fetch_key = Some("key".to_owned());
 
-        p.worker_ended("the email worker stopped".to_owned());
+        let kinds = [
+            BgKind::Root,
+            BgKind::Envelopes,
+            BgKind::Threads,
+            BgKind::Message,
+            BgKind::History,
+            BgKind::Op,
+            BgKind::Send,
+            BgKind::Token,
+        ];
+        for kind in kinds {
+            p.spawn_bg(kind, async move { panic!("a bug in the {kind:?} task") });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while p.bg_panics.lock().unwrap().len() < kinds.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the panics were not caught"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
-        assert!(p.worker.is_none());
+        p.release_panicked_tasks();
+
+        assert!(p.bg_imap.is_none(), "the shared connection is dropped");
         assert!(!p.folder_fetch_inflight.load(Ordering::Acquire));
         assert!(!p.message_fetch_inflight.load(Ordering::Acquire));
         assert!(!p.send_inflight.load(Ordering::Acquire));
@@ -4686,7 +4874,24 @@ mod tests {
             p.bg_completed.load(Ordering::Acquire),
             "a redraw is asked for"
         );
-        assert_eq!(p.take_error().as_deref(), Some("the email worker stopped"));
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("the email client's background work stopped unexpectedly")
+        );
+        assert_eq!(p.take_error(), None, "the user is told once");
+    }
+
+    #[test]
+    fn test_reset_bg_imap_forces_a_reconnect() {
+        let mut p = EmailClientProvider::new();
+        p.config.imap_url = "imaps://imap.example.com".to_owned();
+        p.config.username = "user@example.com".to_owned();
+        let _ = p.bg_imap();
+        assert!(p.bg_imap.is_some());
+
+        // The open connection authenticated with the previous credentials.
+        p.reset_bg_imap();
+        assert!(p.bg_imap.is_none());
     }
 
     /// The sign-in thread asks Google for the address, and the login takes it

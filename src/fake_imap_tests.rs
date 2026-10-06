@@ -8,8 +8,9 @@
 //! credentials.
 //!
 //! They were written against the `imap` 2.x backend and passed unchanged
-//! through the `async-imap` migration and back to the blocking `imap` 3 the
-//! plugin uses: they are the behaviour preservation proof for each port.
+//! through the `async-imap` migration, the blocking `imap` 3 the WASM plugin
+//! used, and back to async-imap: they are the behaviour preservation proof for
+//! each port.
 //!
 //! The server speaks just enough IMAP to drive `RealImap`: it is a scripted
 //! responder, not a real mailbox. It listens on `127.0.0.1:0` and is reached
@@ -538,13 +539,13 @@ fn read_line(reader: &mut BufReader<TcpStream>) -> Option<String> {
 // Connection and authentication
 // ---------------------------------------------------------------------------
 
-#[test]
-fn login_sends_credentials_after_greeting() {
+#[tokio::test]
+async fn login_sends_credentials_after_greeting() {
     let server = FakeImap::start(Options::default());
     let user = unique_user("login");
     let mut imap = RealImap::from_config(&server.config(&user));
 
-    imap.list_folders().expect("list_folders");
+    imap.list_folders().await.expect("list_folders");
 
     let login = server.expect_command("LOGIN");
     assert!(
@@ -558,15 +559,15 @@ fn login_sends_credentials_after_greeting() {
     server.assert_no_command("AUTHENTICATE");
 }
 
-#[test]
-fn xoauth2_sends_the_exact_sasl_payload() {
+#[tokio::test]
+async fn xoauth2_sends_the_exact_sasl_payload() {
     let server = FakeImap::start(Options::default());
     let user = unique_user("xoauth2");
     let mut config = server.config(&user);
     config.oauth_access_token = "ya29.token".to_owned();
     let mut imap = RealImap::from_config(&config);
 
-    imap.list_folders().expect("list_folders");
+    imap.list_folders().await.expect("list_folders");
 
     server.expect_command("AUTHENTICATE XOAUTH2");
     let payload = server.expect_command("SASL-PAYLOAD");
@@ -582,12 +583,12 @@ fn xoauth2_sends_the_exact_sasl_payload() {
 // Folders and envelopes
 // ---------------------------------------------------------------------------
 
-#[test]
-fn list_folders_keeps_special_use_and_drops_noselect() {
+#[tokio::test]
+async fn list_folders_keeps_special_use_and_drops_noselect() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("folders")));
 
-    let folders = imap.list_folders().expect("list_folders");
+    let folders = imap.list_folders().await.expect("list_folders");
 
     let names: Vec<&str> = folders.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
@@ -612,12 +613,15 @@ fn list_folders_keeps_special_use_and_drops_noselect() {
     );
 }
 
-#[test]
-fn list_messages_decodes_envelopes_flags_and_orders_newest_first() {
+#[tokio::test]
+async fn list_messages_decodes_envelopes_flags_and_orders_newest_first() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("headers")));
 
-    let headers = imap.list_messages("INBOX", 50).expect("list_messages");
+    let headers = imap
+        .list_messages("INBOX", 50)
+        .await
+        .expect("list_messages");
 
     assert_eq!(headers.len(), 2);
     // Most-recent-first.
@@ -647,13 +651,14 @@ fn list_messages_decodes_envelopes_flags_and_orders_newest_first() {
 // Message bodies
 // ---------------------------------------------------------------------------
 
-#[test]
-fn fetch_message_parses_literal_body_and_attachment() {
+#[tokio::test]
+async fn fetch_message_parses_literal_body_and_attachment() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("body")));
 
     let msg = imap
         .fetch_message("INBOX", 2)
+        .await
         .expect("fetch_message")
         .expect("UID 2 exists");
 
@@ -683,25 +688,29 @@ fn fetch_message_parses_literal_body_and_attachment() {
     );
 }
 
-#[test]
-fn fetch_message_returns_none_for_unknown_uid() {
+#[tokio::test]
+async fn fetch_message_returns_none_for_unknown_uid() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("missing")));
 
     // The fake server answers UID 99 with a bare OK and no FETCH data.
-    let msg = imap.fetch_message("INBOX", 99).expect("fetch_message");
+    let msg = imap
+        .fetch_message("INBOX", 99)
+        .await
+        .expect("fetch_message");
 
     assert!(msg.is_none(), "a missing UID is Ok(None), not an error");
     server.expect_command("UID FETCH 99");
 }
 
-#[test]
-fn fetch_message_by_message_id_searches_then_fetches() {
+#[tokio::test]
+async fn fetch_message_by_message_id_searches_then_fetches() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("byid")));
 
     let msg = imap
         .fetch_message_by_message_id("INBOX", "<msg2@example.com>")
+        .await
         .expect("fetch_message_by_message_id")
         .expect("search resolves to UID 2");
 
@@ -718,12 +727,13 @@ fn fetch_message_by_message_id_searches_then_fetches() {
 // Mutations
 // ---------------------------------------------------------------------------
 
-#[test]
-fn set_flags_issues_separate_add_and_remove_stores() {
+#[tokio::test]
+async fn set_flags_issues_separate_add_and_remove_stores() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("flags")));
 
     imap.set_flags("INBOX", 2, &["\\Seen"], &["\\Flagged"])
+        .await
         .expect("set_flags");
 
     let cmds = server.commands();
@@ -740,44 +750,47 @@ fn set_flags_issues_separate_add_and_remove_stores() {
     assert!(remove.contains("2 -FLAGS (\\Flagged)"), "{remove}");
 }
 
-#[test]
-fn set_flags_skips_the_store_when_a_side_is_empty() {
+#[tokio::test]
+async fn set_flags_skips_the_store_when_a_side_is_empty() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("flags-one")));
 
     imap.set_flags("INBOX", 2, &["\\Seen"], &[])
+        .await
         .expect("set_flags");
 
     server.expect_command("+FLAGS");
     server.assert_no_command("-FLAGS");
 }
 
-#[test]
-fn copy_message_issues_uid_copy() {
+#[tokio::test]
+async fn copy_message_issues_uid_copy() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("copy")));
 
     imap.copy_message("INBOX", 2, "[Gmail]/All Mail")
+        .await
         .expect("copy_message");
 
     let copy = server.expect_command("UID COPY");
     assert!(copy.contains('2') && copy.contains("All Mail"), "{copy}");
 }
 
-#[test]
-fn move_message_prefers_the_move_extension() {
+#[tokio::test]
+async fn move_message_prefers_the_move_extension() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("move")));
 
     imap.move_message("INBOX", 2, "[Gmail]/Trash")
+        .await
         .expect("move_message");
 
     server.expect_command("UID MOVE");
     server.assert_no_command("UID EXPUNGE");
 }
 
-#[test]
-fn move_message_falls_back_to_copy_delete_expunge() {
+#[tokio::test]
+async fn move_message_falls_back_to_copy_delete_expunge() {
     let server = FakeImap::start(Options {
         reject_move: true,
         ..Default::default()
@@ -785,6 +798,7 @@ fn move_message_falls_back_to_copy_delete_expunge() {
     let mut imap = RealImap::from_config(&server.config(&unique_user("move-fallback")));
 
     imap.move_message("INBOX", 2, "[Gmail]/Trash")
+        .await
         .expect("fallback should still succeed");
 
     // Order matters: COPY must precede the \Deleted flag and the expunge, or a
@@ -806,12 +820,12 @@ fn move_message_falls_back_to_copy_delete_expunge() {
     assert!(store < expunge, "mark \\Deleted before expunging");
 }
 
-#[test]
-fn expunge_uid_targets_a_single_uid() {
+#[tokio::test]
+async fn expunge_uid_targets_a_single_uid() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("expunge")));
 
-    imap.expunge_uid("INBOX", 2).expect("expunge_uid");
+    imap.expunge_uid("INBOX", 2).await.expect("expunge_uid");
 
     let expunge = server.expect_command("UID EXPUNGE");
     assert!(
@@ -820,13 +834,13 @@ fn expunge_uid_targets_a_single_uid() {
     );
 }
 
-#[test]
-fn append_transfers_the_message_as_a_literal() {
+#[tokio::test]
+async fn append_transfers_the_message_as_a_literal() {
     let server = FakeImap::start(Options::default());
     let mut imap = RealImap::from_config(&server.config(&unique_user("append")));
 
     let raw = b"From: a@b.com\r\nSubject: Saved\r\n\r\nSent copy.\r\n";
-    imap.append("[Gmail]/Sent Mail", raw).expect("append");
+    imap.append("[Gmail]/Sent Mail", raw).await.expect("append");
 
     let cmd = server.expect_command("APPEND");
     assert!(cmd.contains("Sent Mail"), "{cmd}");
@@ -846,8 +860,8 @@ fn append_transfers_the_message_as_a_literal() {
 // Threading
 // ---------------------------------------------------------------------------
 
-#[test]
-fn fetch_threads_parses_the_uid_thread_response() {
+#[tokio::test]
+async fn fetch_threads_parses_the_uid_thread_response() {
     let server = FakeImap::start(Options {
         capabilities: "UIDPLUS MOVE THREAD=REFERENCES".to_owned(),
         ..Default::default()
@@ -856,6 +870,7 @@ fn fetch_threads_parses_the_uid_thread_response() {
 
     let threads = imap
         .fetch_threads("INBOX")
+        .await
         .expect("fetch_threads")
         .expect("server advertises THREAD=REFERENCES");
 
@@ -864,12 +879,12 @@ fn fetch_threads_parses_the_uid_thread_response() {
     assert!(thread.contains("REFERENCES UTF-8 ALL"), "{thread}");
 }
 
-#[test]
-fn fetch_threads_returns_none_without_the_capability() {
+#[tokio::test]
+async fn fetch_threads_returns_none_without_the_capability() {
     let server = FakeImap::start(Options::default()); // no THREAD=* advertised
     let mut imap = RealImap::from_config(&server.config(&unique_user("nothreads")));
 
-    let threads = imap.fetch_threads("INBOX").expect("fetch_threads");
+    let threads = imap.fetch_threads("INBOX").await.expect("fetch_threads");
 
     assert!(
         threads.is_none(),
@@ -878,8 +893,8 @@ fn fetch_threads_returns_none_without_the_capability() {
     server.assert_no_command("UID THREAD");
 }
 
-#[test]
-fn fetch_threads_falls_back_to_orderedsubject() {
+#[tokio::test]
+async fn fetch_threads_falls_back_to_orderedsubject() {
     let server = FakeImap::start(Options {
         capabilities: "UIDPLUS THREAD=ORDEREDSUBJECT".to_owned(),
         ..Default::default()
@@ -887,6 +902,7 @@ fn fetch_threads_falls_back_to_orderedsubject() {
     let mut imap = RealImap::from_config(&server.config(&unique_user("ordsubj")));
 
     imap.fetch_threads("INBOX")
+        .await
         .expect("fetch_threads")
         .expect("ORDEREDSUBJECT is also threadable");
 
@@ -924,4 +940,62 @@ fn idle_sets_the_notify_flag_on_unsolicited_exists() {
         "the worker must actually issue IDLE"
     );
     server.expect_command("DONE");
+}
+
+// ---------------------------------------------------------------------------
+// The provider's background work
+// ---------------------------------------------------------------------------
+
+/// Opening the root lists the folders and prefetches INBOX at the same time,
+/// on two connections (`SELECT` belongs to a connection), off the app's call.
+#[test]
+fn the_root_lists_folders_and_prefetches_inbox_on_two_connections() {
+    let server = FakeImap::start(Options::default());
+    let mut config = server.config(&unique_user("root"));
+    config.oauth_access_token = "ya29.token".to_owned();
+    config.token_expiry = crate::oauth2::now_secs() + 3600;
+    let mut p = crate::EmailClientProvider::new();
+    p.config = config;
+    // What `init` does once it has the settings.
+    p.rebuild_backends();
+
+    let first = p.fetch();
+    assert!(
+        first
+            .iter()
+            .all(|e| e.as_obj().is_none_or(|o| o.key != "INBOX")),
+        "the call answers before the server does: {first:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.folder_fetch_inflight.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the root fetch never finished");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let root = p.fetch();
+    assert!(
+        root.iter()
+            .any(|e| e.as_obj().is_some_and(|o| o.key == "INBOX")),
+        "{root:?}"
+    );
+    // INBOX was prefetched alongside the folder list, so entering it shows
+    // its messages at once, without waiting on another fetch.
+    p.push_path("INBOX");
+    let inbox = p.fetch();
+    assert!(
+        inbox
+            .iter()
+            .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Second subject"))),
+        "{inbox:?}"
+    );
+    assert_eq!(
+        p.message_cache.iter().map(|h| h.uid).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    let logins = server
+        .commands()
+        .iter()
+        .filter(|c| c.contains("AUTHENTICATE XOAUTH2"))
+        .count();
+    assert_eq!(logins, 2, "{:?}", server.commands());
 }

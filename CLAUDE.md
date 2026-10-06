@@ -29,53 +29,67 @@ GitHub releases, one build per platform. The plugin platform is described in
 
 ## How it works
 
-The app waits for every call to answer, drawing nothing meanwhile, and an IMAP
+The app waits for every call to answer, drawing nothing meanwhile (there is no
+per-call deadline, only 10 seconds for the startup handshake), and an IMAP
 round trip can take a while, so the mail servers are never contacted on a
 call:
 
-- **The worker** (`worker.rs`) is one thread for the plugin's life, holding the
-  one IMAP connection. The UI side sends it `Job`s over a channel and it
-  answers `Done`s, JSON both ways. `poll` drains them, and `apply_done` puts
-  each answer in the result slot the rendering code already looked in. A
-  worker whose thread ended (a panic in a job) is noticed there too
-  (`worker_ended`), so nothing waits on it, and the next job starts another.
-  Tests that inject a `MockImap` stay on the synchronous path (`bg_enabled`).
-- **IDLE** (`idle.rs`) is a thread per watched folder, raising the flag `poll`
-  turns into `needs_refresh`. It waits in 10-second rounds and checks between
-  them whether it was stopped. A refreshed OAuth token reaches it through a
-  shared slot.
+- **The email runtime** (`connection::runtime`) is one multi-threaded tokio
+  runtime for the plugin's life. A call that needs the network spawns a task
+  on it (`spawn_envelope_fetch`, `spawn_message_fetch`, `spawn_root_fetch`,
+  `spawn_send`, `spawn_bg_op` and so on). The task writes its answer into a
+  result slot (`Arc<Mutex<Option<..>>>`) that the rendering code reads, and
+  raises `bg_completed`, which `poll` turns into a redraw. The tasks share one
+  IMAP connection behind an async mutex (`bg_imap`), except the root fetch,
+  which lists the folders and prefetches INBOX on two connections at once.
+  Every task goes through `spawn_bg`, which catches a panic, so whatever was
+  waiting on it is released (`release_panicked_tasks`) instead of loading
+  forever. Tests that inject a `MockImap` stay on the synchronous path
+  (`bg_enabled`), bridged with `connection::block_on`.
+- **IDLE** (`idle.rs`) is a task per watched folder, raising the flag `poll`
+  turns into `needs_refresh`. A `CancellationToken` stops it at once, and it
+  re-issues IDLE every 29 minutes (RFC 2177). A refreshed OAuth token reaches
+  it through a shared slot.
 - **The Google sign-in** (`oauth2.rs`) runs on a thread of its own: it asks
   the app to run the browser redirect
   (`sicompass_sdk::plugin::desktop::oauth_redirect`, RFC 8252: the app opens
   the browser and listens once on a loopback port), then exchanges the code
   and asks Google for the address. `PendingAuthorize::poll` picks the result
   up. Outside sicompass (the tests) the app is not there, so it fails at once
-  without reaching Google.
-- **IMAP** is the blocking `imap` 3 crate over `connection::ImapStream`: a
-  `std::net::TcpStream` (resolved with `ToSocketAddrs`, connected with
-  `connect_timeout`) and rustls with ring, with the webpki roots. `imap://` in
-  the clear is refused unless every address is loopback, which only the fake
-  server in `fake_imap_tests.rs` is.
-- **SMTP** is a few commands by hand in `net.rs` (`Smtp`), implicit TLS for
-  `smtps://` and STARTTLS for `smtp://`. lettre only builds the message.
-- **The envelope cache** (`cache.rs`) is one JSON file per account in
-  `storage_dir()/cache`, opened lazily so only the worker ever opens it. It
-  was SQLite. Two tabs are two processes, and the last write wins, which is
-  harmless for a copy of what the server has.
+  without reaching Google. Host calls block, so never make one directly in a
+  tokio task (the token refresh runs on `spawn_blocking`).
+- **IMAP** is async-imap over `connection::ImapStream`: a tokio `TcpStream`
+  (every resolved address tried, each connect bounded by `IO_TIMEOUT`) and
+  tokio-rustls with ring, with the webpki roots. Each exchange is bounded by
+  `net::IMAP_TIMEOUT`, and a failed one drops the session so the next
+  reconnects. `imap://` in the clear is refused unless every address is
+  loopback, which only the fake server in `fake_imap_tests.rs` is. `UID
+  THREAD` goes over `connection::RawImap`, because no imap-proto release can
+  parse its answer.
+- **SMTP** is lettre's async transport with rustls (ring): implicit TLS for
+  `smtps://`, STARTTLS for `smtp://`, required, so a server that will not
+  upgrade gets no credentials.
+- **The envelope cache** (`cache.rs`) is one SQLite database per account in
+  `storage_dir()/cache` (bundled SQLite, compiled into the program), opened
+  lazily by a connection the first time it lists or flags messages. Several
+  connections, and two tabs (two processes), share the file: it is in WAL
+  mode with a busy timeout, and each batch is one transaction. It used to be a JSON file (SQLite did not build
+  for WASM), which is removed when the database opens.
 - **The sign-in** (OAuth tokens, and the servers and address it filled in) is
   kept in the plugin's storage folder
   (`sicompass_sdk::plugin::storage_dir()/email.json`, in the shape of a
   settings file), since a plugin cannot write the app's settings. The settings
   the manifest declares are read at `init`, and a saved sign-in takes over.
 - **HTTP** (Google's endpoints only) goes through `src/http.rs`, a small
-  client in the shape of `reqwest::blocking` over `ureq` (rustls with ring and
-  bundled roots). A token refresh before a send runs on a call from the app,
-  so a request times out after 8 seconds.
+  blocking client in the shape of `reqwest::blocking` over `ureq` (rustls with
+  ring and bundled roots). A token refresh before a send runs on a call from
+  the app, so a request times out after 30 seconds.
 - **Undo** entries are `ProviderOp`s: the IMAP action's name and its fields as
-  an FFON list (`encode_op`, `decode_op`).
+  an FFON list (`encode_op`, `decode_op`). Undo and redo run in the background
+  like any other write.
 - The tests never reach a real mail server or Google: a fake IMAP server on
-  loopback, one-shot HTTP servers on loopback, and the sign-in failing outside
-  sicompass.
+  loopback, fake SMTP servers on loopback, one-shot HTTP servers on loopback,
+  and the sign-in failing outside sicompass.
 
 ## Environment (Nix)
 
@@ -87,6 +101,12 @@ system-wide.
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
   - Empty: prefix every toolchain command with `nix develop -c`.
+  - Inside another repo's shell (the sicompass one), `cargo test` works, but
+    the release build needs this repo's: its Rust has the musl target, and it
+    sets `CC_<target>` to a musl C compiler, which the bundled SQLite needs
+    (the shell's own cc compiles against glibc's headers, and the link
+    fails on `open64` and `__memcpy_chk`). Run it as
+    `env -u LD_LIBRARY_PATH nix develop "git+file://$PWD" -c ...`.
 - `nix develop -c <cmd>` prints a `warning: Git tree ... is dirty` line on
   stderr first. That warning is noise, not a failure.
 - Evaluate the flake through `git+file://$PWD`, never a plain path (a plain path

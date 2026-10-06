@@ -52,9 +52,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # musl-gcc compiles the C the static build carries (SQLite) against
+      # musl's headers. Named explicitly: for aarch64 the cc crate would look
+      # for aarch64-linux-musl-gcc, which musl-tools does not install.
       - name: musl tools
         if: contains(matrix.target, '-linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools jq
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools jq
+          echo "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         shell: bash
         run: ./scripts/release-plugin.sh build ${{ matrix.target }}

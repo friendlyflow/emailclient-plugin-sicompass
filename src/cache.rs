@@ -1,4 +1,4 @@
-//! The envelope cache.
+//! SQLite-backed envelope cache.
 //!
 //! Stores message headers (not bodies) per `(folder, uid)` so that repeated
 //! visits to the same folder avoid a full IMAP round-trip when nothing has
@@ -6,19 +6,19 @@
 //! different UIDVALIDITY for a folder, the cached envelopes for that folder
 //! are flushed and rebuilt from scratch.
 //!
-//! One JSON file per account, `cache/<hex_username>.json` in the plugin's
+//! One database per account, `cache/<hex_username>.db` in the plugin's
 //! storage folder (in the unit tests, which run outside sicompass,
-//! `$XDG_CACHE_HOME/sicompass/email`), rewritten whole after each change
-//! through a temporary file and a rename. It used to be SQLite. In a process
-//! there is one writer, the background worker, the only part of the plugin
-//! that fetches. Two tabs are two processes, and the last write wins, which
-//! is harmless for a copy of what the server has.
+//! `$XDG_CACHE_HOME/sicompass/email`). A change writes only the rows it
+//! touches. Two tabs are two processes on the same file: the database is in
+//! WAL mode and waits for the other's write instead of failing.
 
 use crate::MessageHeader;
-use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use rusqlite::{Connection, params};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long a write waits for the other tab's write to finish.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the cache files live.
 fn cache_dir() -> Option<PathBuf> {
@@ -42,55 +42,77 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// One folder's cached state.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct FolderCache {
-    uidvalidity: u32,
-    count: usize,
-    envelopes: BTreeMap<u32, MessageHeader>,
-}
-
 pub struct EnvelopeCache {
-    path: PathBuf,
-    folders: RefCell<BTreeMap<String, FolderCache>>,
+    conn: Connection,
 }
 
 impl EnvelopeCache {
-    /// Open (or create) the cache for `username`.
+    /// Open (or create) the cache DB for `username`.
     ///
-    /// Returns `None` if the cache directory cannot be created. The caller
-    /// then silently falls back to uncached IMAP.
+    /// Returns `None` if the cache directory cannot be created or the DB
+    /// cannot be opened — the caller silently falls back to uncached IMAP.
     pub fn open(username: &str) -> Option<Self> {
-        let cache_dir = cache_dir()?;
-        std::fs::create_dir_all(&cache_dir).ok()?;
+        Self::open_in_dir(&cache_dir()?, username)
+    }
+
+    /// [`EnvelopeCache::open`], in `cache_dir`.
+    fn open_in_dir(cache_dir: &Path, username: &str) -> Option<Self> {
+        std::fs::create_dir_all(cache_dir).ok()?;
         // Safe filename: hex-encode the username bytes.
         let hex: String = username.bytes().map(|b| format!("{b:02x}")).collect();
-        Some(Self::open_at(cache_dir.join(format!("{hex}.json"))))
+        let cache = Self::open_at(&cache_dir.join(format!("{hex}.db")))?;
+        // The JSON file the cache was kept in before. Only a copy of what the
+        // server has, so it is dropped rather than carried over.
+        let _ = std::fs::remove_file(cache_dir.join(format!("{hex}.json")));
+        let _ = std::fs::remove_file(cache_dir.join(format!("{hex}.json.tmp")));
+        Some(cache)
     }
 
-    /// The cache kept in `path`. A missing or unreadable file is an empty
-    /// cache: it is only ever a copy of what the server has.
-    fn open_at(path: PathBuf) -> Self {
-        let folders = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        EnvelopeCache {
-            path,
-            folders: RefCell::new(folders),
+    /// The cache kept in `path`. A file that is not a usable database is
+    /// replaced by an empty one: it is only ever a copy of what the server
+    /// has.
+    fn open_at(path: &Path) -> Option<Self> {
+        if let Some(cache) = Self::try_open(path) {
+            return Some(cache);
         }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(p));
+        }
+        Self::try_open(path)
     }
 
-    /// Write the cache out, through a temporary file so a crash mid-write
-    /// leaves the previous version.
-    fn save(&self) {
-        let Ok(json) = serde_json::to_vec(&*self.folders.borrow()) else {
-            return;
-        };
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
+    fn try_open(path: &Path) -> Option<Self> {
+        let conn = Connection::open(path).ok()?;
+        conn.busy_timeout(BUSY_TIMEOUT).ok()?;
+        // `journal_mode` answers with the mode it settled on, so it is a query.
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .ok()?;
+        let cache = EnvelopeCache { conn };
+        cache.init_schema().ok()?;
+        Some(cache)
+    }
+
+    fn init_schema(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS folder_meta (
+                folder       TEXT PRIMARY KEY,
+                uidvalidity  INTEGER NOT NULL,
+                count        INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS envelopes (
+                folder    TEXT    NOT NULL,
+                uid       INTEGER NOT NULL,
+                from_addr TEXT    NOT NULL,
+                subject   TEXT    NOT NULL,
+                date      TEXT    NOT NULL,
+                seen      INTEGER NOT NULL,
+                flagged   INTEGER NOT NULL,
+                message_id TEXT   NOT NULL DEFAULT '',
+                PRIMARY KEY (folder, uid)
+             );",
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -99,27 +121,68 @@ impl EnvelopeCache {
 
     /// Stored UIDVALIDITY for `folder`, or `None` if not cached yet.
     pub fn get_uidvalidity(&self, folder: &str) -> Option<u32> {
-        self.folders.borrow().get(folder).map(|f| f.uidvalidity)
+        self.conn
+            .query_row(
+                "SELECT uidvalidity FROM folder_meta WHERE folder = ?1",
+                params![folder],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v as u32)
     }
 
     /// Number of envelopes cached for `folder`.
     pub fn cached_count(&self, folder: &str) -> usize {
-        self.folders.borrow().get(folder).map_or(0, |f| f.count)
+        self.conn
+            .query_row(
+                "SELECT count FROM folder_meta WHERE folder = ?1",
+                params![folder],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v as usize)
+            .unwrap_or(0)
     }
 
     /// Highest cached UID for `folder`, or `None` if the folder is not cached.
     pub fn max_uid(&self, folder: &str) -> Option<u32> {
-        let folders = self.folders.borrow();
-        folders.get(folder)?.envelopes.keys().next_back().copied()
+        self.conn
+            .query_row(
+                "SELECT MAX(uid) FROM envelopes WHERE folder = ?1",
+                params![folder],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|v| v as u32)
     }
 
     /// Return the `limit` most-recent envelopes (by UID descending) for `folder`.
     pub fn get_latest(&self, folder: &str, limit: usize) -> Vec<MessageHeader> {
-        let folders = self.folders.borrow();
-        let Some(f) = folders.get(folder) else {
-            return vec![];
+        let mut stmt = match self.conn.prepare(
+            "SELECT uid, from_addr, subject, date, seen, flagged, message_id
+               FROM envelopes
+              WHERE folder = ?1
+           ORDER BY uid DESC
+              LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
         };
-        f.envelopes.values().rev().take(limit).cloned().collect()
+        stmt.query_map(params![folder, limit as i64], |row| {
+            Ok(MessageHeader {
+                uid: row.get::<_, i64>(0)? as u32,
+                from: row.get(1)?,
+                subject: row.get(2)?,
+                date: row.get(3)?,
+                seen: row.get::<_, i64>(4)? != 0,
+                flagged: row.get::<_, i64>(5)? != 0,
+                message_id: row.get(6).unwrap_or_default(),
+            })
+        })
+        .ok()
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -128,27 +191,52 @@ impl EnvelopeCache {
 
     /// Delete all cached envelopes for `folder` and record the new UIDVALIDITY.
     pub fn invalidate_folder(&self, folder: &str, new_uidvalidity: u32) {
-        self.folders.borrow_mut().insert(
-            folder.to_owned(),
-            FolderCache {
-                uidvalidity: new_uidvalidity,
-                ..Default::default()
-            },
-        );
-        self.save();
+        let _ = self.in_transaction(|conn| {
+            conn.execute("DELETE FROM envelopes WHERE folder = ?1", params![folder])?;
+            conn.execute(
+                "INSERT INTO folder_meta (folder, uidvalidity, count)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT(folder) DO UPDATE SET uidvalidity = excluded.uidvalidity, count = 0",
+                params![folder, new_uidvalidity as i64],
+            )?;
+            Ok(())
+        });
     }
 
     /// Insert or replace a batch of envelopes and update the folder count.
     pub fn upsert_all(&self, folder: &str, headers: &[MessageHeader]) {
-        {
-            let mut folders = self.folders.borrow_mut();
-            let f = folders.entry(folder.to_owned()).or_default();
+        let _ = self.in_transaction(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "INSERT INTO envelopes (folder, uid, from_addr, subject, date, seen, flagged, message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(folder, uid) DO UPDATE SET
+                   from_addr  = excluded.from_addr,
+                   subject    = excluded.subject,
+                   date       = excluded.date,
+                   seen       = excluded.seen,
+                   flagged    = excluded.flagged,
+                   message_id = excluded.message_id",
+            )?;
             for h in headers {
-                f.envelopes.insert(h.uid, h.clone());
+                stmt.execute(params![
+                    folder,
+                    h.uid as i64,
+                    &h.from,
+                    &h.subject,
+                    &h.date,
+                    h.seen as i64,
+                    h.flagged as i64,
+                    &h.message_id,
+                ])?;
             }
-            f.count = f.envelopes.len();
-        }
-        self.save();
+            conn.execute(
+                "INSERT INTO folder_meta (folder, uidvalidity, count)
+                 VALUES (?1, 0, (SELECT COUNT(*) FROM envelopes WHERE folder = ?1))
+                 ON CONFLICT(folder) DO UPDATE SET count = excluded.count",
+                params![folder],
+            )?;
+            Ok(())
+        });
     }
 
     /// Update seen/flagged status for a single cached envelope.
@@ -166,35 +254,44 @@ impl EnvelopeCache {
         new_seen: Option<bool>,
         new_flagged: Option<bool>,
     ) {
-        {
-            let mut folders = self.folders.borrow_mut();
-            let Some(h) = folders
-                .get_mut(folder)
-                .and_then(|f| f.envelopes.get_mut(&uid))
-            else {
-                return;
-            };
-            if let Some(seen) = new_seen {
-                h.seen = seen;
-            }
-            if let Some(flagged) = new_flagged {
-                h.flagged = flagged;
-            }
+        if let Some(seen) = new_seen {
+            let _ = self.conn.execute(
+                "UPDATE envelopes SET seen = ?3 WHERE folder = ?1 AND uid = ?2",
+                params![folder, uid as i64, seen as i64],
+            );
         }
-        self.save();
+        if let Some(flagged) = new_flagged {
+            let _ = self.conn.execute(
+                "UPDATE envelopes SET flagged = ?3 WHERE folder = ?1 AND uid = ?2",
+                params![folder, uid as i64, flagged as i64],
+            );
+        }
     }
 
     /// Remove a single cached envelope (after EXPUNGE).
     pub fn remove(&self, folder: &str, uid: u32) {
-        {
-            let mut folders = self.folders.borrow_mut();
-            let Some(f) = folders.get_mut(folder) else {
-                return;
-            };
-            f.envelopes.remove(&uid);
-            f.count = f.envelopes.len();
-        }
-        self.save();
+        let _ = self.in_transaction(|conn| {
+            conn.execute(
+                "DELETE FROM envelopes WHERE folder = ?1 AND uid = ?2",
+                params![folder, uid as i64],
+            )?;
+            conn.execute(
+                "UPDATE folder_meta SET count = (SELECT COUNT(*) FROM envelopes WHERE folder = ?1)
+                  WHERE folder = ?1",
+                params![folder],
+            )?;
+            Ok(())
+        });
+    }
+
+    /// Run `f` in one transaction, so the other tab never sees half of it.
+    fn in_transaction(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        f(&tx)?;
+        tx.commit()
     }
 }
 
@@ -208,7 +305,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_in(dir: &std::path::Path) -> EnvelopeCache {
-        EnvelopeCache::open_at(dir.join("test.json"))
+        EnvelopeCache::open_at(&dir.join("test.db")).expect("the cache opens")
     }
 
     fn hdr(uid: u32, subject: &str) -> MessageHeader {
@@ -318,10 +415,50 @@ mod tests {
     #[test]
     fn test_an_unreadable_file_starts_empty() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("test.json"), "not json").unwrap();
+        std::fs::write(dir.path().join("test.db"), "not a database, not even close").unwrap();
         let cache = open_in(dir.path());
         assert_eq!(cache.get_uidvalidity("INBOX"), None);
         cache.upsert_all("INBOX", &[hdr(1, "A")]);
         assert_eq!(open_in(dir.path()).cached_count("INBOX"), 1);
+    }
+
+    /// Two tabs are two processes with the same account: each sees what the
+    /// other wrote, and neither's write is lost to the other's.
+    #[test]
+    fn two_tabs_share_the_cache() {
+        let dir = tempdir().unwrap();
+        let first = open_in(dir.path());
+        let second = open_in(dir.path());
+        first.invalidate_folder("INBOX", 3);
+        first.upsert_all("INBOX", &[hdr(1, "A")]);
+        second.upsert_all("INBOX", &[hdr(2, "B")]);
+        assert_eq!(first.cached_count("INBOX"), 2);
+        second.patch_flags("INBOX", 1, None, Some(true));
+        let latest = first.get_latest("INBOX", 10);
+        assert_eq!(latest.len(), 2);
+        assert!(latest[1].flagged, "the other tab's flag change is seen");
+        assert_eq!(second.get_uidvalidity("INBOX"), Some(3));
+    }
+
+    /// The cache used to be one JSON file per account. Opening the database
+    /// removes it, so it does not linger next to its replacement.
+    #[test]
+    fn opening_the_database_removes_the_old_json_file() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path();
+        let hex: String = "old@example.com"
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let json = cache_dir.join(format!("{hex}.json"));
+        std::fs::write(&json, "{}").unwrap();
+        std::fs::write(cache_dir.join(format!("{hex}.json.tmp")), "{").unwrap();
+
+        let cache =
+            EnvelopeCache::open_in_dir(cache_dir, "old@example.com").expect("the cache opens");
+        cache.upsert_all("INBOX", &[hdr(1, "A")]);
+        assert!(!json.exists(), "the JSON cache is removed");
+        assert!(!cache_dir.join(format!("{hex}.json.tmp")).exists());
+        assert!(cache_dir.join(format!("{hex}.db")).exists());
     }
 }
