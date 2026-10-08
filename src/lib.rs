@@ -4116,6 +4116,15 @@ impl EmailClientProvider {
 mod tests {
     use super::*;
 
+    /// Fetching a message marks it read on the server, so scroll mode must not
+    /// fetch a folder's messages ahead of the user.
+    #[test]
+    fn scroll_mode_may_not_fetch_ahead() {
+        assert!(!<EmailClientProvider as Plugin>::allows_scroll_prefetch(
+            &EmailClientProvider::new()
+        ));
+    }
+
     // ---- Mock backends ----
 
     struct MockImap {
@@ -7974,6 +7983,13 @@ impl Plugin for EmailClientProvider {
 
     fn init(&mut self) {
         EmailClientProvider::init(self);
+    }
+
+    /// A message is fetched with `BODY[]`, which marks it read on the server,
+    /// and every folder level is a network round trip. Scroll mode shows only
+    /// what the user opened.
+    fn allows_scroll_prefetch(&self) -> bool {
+        false
     }
 
     fn cleanup(&mut self) {
