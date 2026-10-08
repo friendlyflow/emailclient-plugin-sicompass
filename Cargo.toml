@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model, from crates.io.
-sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
+sicompass-sdk = { version = "0.9.6", default-features = false, features = ["plugin"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # All email I/O runs on one tokio runtime (`connection::runtime`), off the
