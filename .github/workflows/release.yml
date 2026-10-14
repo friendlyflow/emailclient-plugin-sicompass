@@ -29,7 +29,7 @@ permissions:
 
 env:
   # The SDK release whose `sicompass-plugin` packs plugin processes.
-  SDK_TAG: v0.9.1
+  SDK_TAG: v0.9.9
 
 jobs:
   build:

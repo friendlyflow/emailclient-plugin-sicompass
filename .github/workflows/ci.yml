@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SDK_TAG: v0.9.1
+  SDK_TAG: v0.9.9
 
 jobs:
   check:
