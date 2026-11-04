@@ -918,10 +918,11 @@ fn parse_body_part(raw: &str, content_type: &str, cte: &str) -> MailBody {
         if let Some(boundary) = extract_boundary(content_type) {
             return parse_multipart(raw, &boundary);
         }
-        return MailBody::Text(raw.to_owned());
+        return MailBody::Text(crate::escape::strip_link_marks(raw));
     }
 
-    let decoded = decode_transfer_encoding(raw, cte);
+    // Only the HTML conversion below may mark a link in a body.
+    let decoded = crate::escape::strip_link_marks(&decode_transfer_encoding(raw, cte));
 
     match mime {
         "text/html" => {
@@ -1464,5 +1465,164 @@ mod tests {
     fn test_parse_thread_no_thread_line() {
         let threads = parse_thread_response("* OK [CAPABILITY IMAP4rev1]\r\n");
         assert!(threads.is_empty());
+    }
+
+    // ---- Text from outside stays text --------------------------------------
+
+    fn body_row(content_type: &str, body: &str) -> String {
+        let raw = format!("From: a@b\r\nSubject: s\r\nContent-Type: {content_type}\r\n\r\n{body}");
+        let msg = parse_rfc2822(1, raw.as_bytes());
+        crate::build_message_view(&msg)
+            .into_iter()
+            .nth(4)
+            .and_then(|e| e.as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("a body row for {body}"))
+    }
+
+    fn assert_inert(row: &str) {
+        use sicompass_sdk::{markup, tags};
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert!(markup::targets(row).is_empty(), "a target in {row:?}");
+        assert!(markup::style_sheet(row).is_none(), "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert!(!tags::has_id(row), "an id in {row:?}");
+    }
+
+    #[test]
+    fn html_text_that_looks_like_a_tag_stays_text() {
+        use sicompass_sdk::tags;
+        for (html, shown) in [
+            ("<p>&lt;b&gt;x&lt;/b&gt;</p>", "<b>x</b>"),
+            (
+                "<p>&lt;img src=\"/etc/passwd\"&gt;</p>",
+                "<img src=\"/etc/passwd\">",
+            ),
+            (
+                "<p>&lt;style&gt;li { color: red }&lt;/style&gt;</p>",
+                "<style>li { color: red }</style>",
+            ),
+            ("<p>&lt;input&gt;y&lt;/input&gt;</p>", "<input>y</input>"),
+            (
+                "<p>&lt;button&gt;send&lt;/button&gt;</p>",
+                "<button>send</button>",
+            ),
+            ("<pre>&lt;b&gt;x&lt;/b&gt;</pre>", "<b>x</b>"),
+            (r"<p>ends in a backslash\</p>", r"ends in a backslash\"),
+        ] {
+            let row = body_row("text/html", html);
+            assert_inert(&row);
+            assert_eq!(tags::strip_display(&row), shown, "{html}");
+        }
+    }
+
+    /// The conversion leaves these unescaped or live, and writes them for a form:
+    /// nothing it hands back is taken on trust.
+    #[test]
+    fn html_cannot_make_a_live_element_by_any_route() {
+        for html in [
+            r#"<img src="/home/user/secret.png">"#,
+            r#"<img src="/home/user/secret.png" alt="<img src='/etc/passwd'>">"#,
+            r#"<table><tr><td>&lt;img src="/etc/passwd"&gt;</td></tr></table>"#,
+            r"<table><tr><td>&lt;input&gt;y&lt;/input&gt;</td></tr></table>",
+            r"<table><tr><td>&lt;button&gt;send&lt;/button&gt;Send</td></tr></table>",
+            r#"<form><input name="a" value="<button>send</button>x"></form>"#,
+            r#"<form><input name="<b>a</b>" value="v"><input type="submit" value="<b>go</b>"></form>"#,
+            r#"<form><input type="checkbox" name="<img src='/etc/passwd'>"></form>"#,
+            r#"<form><textarea name="t">&lt;input&gt;y&lt;/input&gt;</textarea></form>"#,
+            r#"<form><select name="s"><option value="<b>v</b>">o</option></select></form>"#,
+            r#"<div id="<b>x</b>"><h1 id="<input>y</input>">title</h1></div>"#,
+            r#"<a href="/home/user/secret.json">t</a>"#,
+            r#"<a href="file:///etc/passwd">t</a>"#,
+            r#"<a href="javascript:alert(1)">t</a>"#,
+            r#"<p>t <a href="mailto:a@b.c">m</a></p>"#,
+            r#"<a href="https://x y">t</a>"#,
+            r#"<a href="https://x\">t</a>"#,
+            r#"<a href="https://x<img src='/etc/passwd'>">t</a>"#,
+        ] {
+            assert_inert(&body_row("text/html", html));
+        }
+    }
+
+    /// The whole `href` is one link, its brackets percent-encoded, with no image in it.
+    #[test]
+    fn a_link_in_html_cannot_smuggle_an_image_past_its_closing_tag() {
+        let row = body_row(
+            "text/html",
+            r#"<a href="https://x</link><image>/etc/passwd</image>">t</a>"#,
+        );
+        let targets = sicompass_sdk::markup::targets(&row);
+        assert_eq!(targets.len(), 1, "{row}");
+        assert_eq!(
+            targets[0].kind,
+            sicompass_sdk::tags::TargetKind::Link,
+            "{row}"
+        );
+        assert_eq!(
+            targets[0].value, "https://x%3C/link%3E%3Cimage%3E/etc/passwd%3C/image%3E",
+            "{row}"
+        );
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+    }
+
+    #[test]
+    fn a_web_link_in_html_stays_a_link_with_its_url_showing() {
+        use sicompass_sdk::{markup, tags};
+        let row = body_row(
+            "text/html",
+            r#"<p>&lt;b&gt; see <a href="https://example.com/a?b=1&amp;c=2">here</a></p>"#,
+        );
+        assert!(!markup::has_markup(&row), "{row}");
+        let targets = markup::targets(&row);
+        assert_eq!(targets.len(), 1, "{row}");
+        assert_eq!(targets[0].kind, tags::TargetKind::Link);
+        assert_eq!(targets[0].value, "https://example.com/a?b=1&c=2");
+        let shown = tags::strip_display(&row);
+        assert!(shown.contains("<b> see"), "{shown}");
+        assert!(
+            shown.contains("here https://example.com/a?b=1&c=2"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_plain_body_cannot_forge_a_link_mark() {
+        for content_type in ["text/plain", "text/html", "application/json"] {
+            let row = body_row(content_type, "a\u{FDD0}https://evil.example\u{FDD1}");
+            assert_inert(&row);
+            assert!(!row.contains('\u{FDD0}'), "{row}");
+        }
+    }
+
+    /// JSON that parses as FFON becomes a tree whatever the Content-Type claims.
+    #[test]
+    fn a_tree_in_a_body_is_read_as_text() {
+        use sicompass_sdk::tags;
+        for content_type in ["text/plain", "application/json"] {
+            let raw = format!(
+                "From: a@b\r\nSubject: s\r\nContent-Type: {content_type}\r\n\r\n{}",
+                r#"["<button>send</button>Send", "<img src='/etc/passwd'>", {"<image>/etc/passwd</image>": ["<b>x</b>"]}]"#,
+            );
+            let msg = parse_rfc2822(1, raw.as_bytes());
+            assert!(matches!(&msg.body, MailBody::Ffon(_)), "{:?}", msg.body);
+            let items = crate::build_message_view(&msg);
+            let key = |e: &sicompass_sdk::ffon::FfonElement| match e {
+                sicompass_sdk::ffon::FfonElement::Str(s) => s.clone(),
+                sicompass_sdk::ffon::FfonElement::Obj(o) => o.key.clone(),
+            };
+            let button = key(&items[4]);
+            assert_inert(&button);
+            assert_eq!(tags::strip_display(&button), "<button>send</button>Send");
+            let image = key(&items[5]);
+            assert_inert(&image);
+            assert_eq!(tags::strip_display(&image), "<img src='/etc/passwd'>");
+            let obj = key(&items[6]);
+            assert_inert(&obj);
+            assert!(sicompass_sdk::tags::extract_image(&obj).is_none(), "{obj}");
+            assert_eq!(tags::strip_display(&obj), "<image>/etc/passwd</image>");
+            let child = key(&items[6].as_obj().unwrap().children[0]);
+            assert_inert(&child);
+            assert_eq!(tags::strip_display(&child), "<b>x</b>");
+        }
     }
 }

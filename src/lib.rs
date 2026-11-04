@@ -47,6 +47,7 @@
 
 pub mod cache;
 pub mod connection;
+mod escape;
 // The wire tests against a fake IMAP server, in the crate so they reach its
 // private parts.
 #[cfg(test)]
@@ -70,6 +71,7 @@ use sicompass_sdk::ffon::{FfonElement, FfonObject};
 use sicompass_sdk::placeholders::{I_PLACEHOLDER, new_obj_with_i_placeholder, seed_i_placeholders};
 use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult, ProviderOp};
 use sicompass_sdk::provider::{ListItem, SearchResultItem};
+use sicompass_sdk::tags;
 use sicompass_sdk::timeline::ImapOpKind;
 
 use idle::IdleController;
@@ -81,7 +83,10 @@ use idle::IdleController;
 /// The body of an email message, tagged with its content kind.
 ///
 /// - `Text`  — plain text (`text/plain`); incoming HTML is flattened to this at parse time.
-/// - `Ffon`  — a structured FFON tree (`application/json` that passes `is_ffon`)
+///   Never escaped. A row is built from it with [`escape::text_row`] or `tags::escape`.
+/// - `Ffon`  — a structured FFON tree (`application/json` that passes `is_ffon`). On an
+///   [`EmailMessage`] it is what the sender wrote, unread and untrusted, and on a
+///   [`Draft`] it is rows ready to show. See [`escape`] for the conversions.
 #[derive(Debug, Clone)]
 pub enum MailBody {
     Text(String),
@@ -98,13 +103,14 @@ impl MailBody {
     /// Return a plain-text representation for quoting or fallback display.
     pub fn as_plain(&self) -> String {
         match self {
-            MailBody::Text(s) => s.clone(),
+            MailBody::Text(s) => escape::strip_link_marks(s),
             MailBody::Ffon(elems) => sicompass_sdk::ffon::to_json_string(elems).unwrap_or_default(),
         }
     }
 }
 
-/// Recursively flatten an FFON tree to a plain-text string.
+/// Recursively flatten an FFON tree that came from HTML to a plain-text string,
+/// with no tags left in it but the links it found, see [`escape::marked_text`].
 pub(crate) fn flatten_ffon_to_text(elems: &[FfonElement]) -> String {
     let mut out = String::new();
     for elem in elems {
@@ -113,13 +119,13 @@ pub(crate) fn flatten_ffon_to_text(elems: &[FfonElement]) -> String {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(s);
+                out.push_str(&escape::marked_text(s));
             }
             FfonElement::Obj(o) => {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(&o.key);
+                out.push_str(&escape::marked_text(&o.key));
                 let children_text = flatten_ffon_to_text(&o.children);
                 if !children_text.is_empty() {
                     out.push('\n');
@@ -394,7 +400,7 @@ fn folder_display_name(imap_name: &str) -> &str {
 fn envelope_items(headers: &[MessageHeader], limit: usize) -> Vec<FfonElement> {
     let mut items: Vec<FfonElement> = headers
         .iter()
-        .map(|h| FfonElement::new_obj(message_label(h)))
+        .map(|h| FfonElement::new_obj(message_row(h)))
         .collect();
     if items.is_empty() {
         items.push(FfonElement::new_str("(no messages)".to_owned()));
@@ -424,6 +430,17 @@ fn message_label(h: &MessageHeader) -> String {
         format!("{} — {}", h.subject, h.from)
     };
     format!("{read_tag}{star_tag} {body}")
+}
+
+/// A message's row: its label, which is plain text and what `lookup_uid` compares,
+/// with what the sender wrote made harmless.
+fn message_row(h: &MessageHeader) -> String {
+    tags::escape(&message_label(h))
+}
+
+/// A row in the History view.
+fn history_row(from: &str, subject: &str) -> String {
+    tags::escape(&format!("From: {from} — Subject: {subject}"))
 }
 
 /// Strip all leading `[tag]` prefixes from a message label, returning the bare
@@ -1550,7 +1567,9 @@ impl EmailClientProvider {
         let mut items = vec![];
         match folder_result {
             Err(e) => {
-                items.push(FfonElement::new_str(format!("IMAP error: {e}")));
+                items.push(FfonElement::new_str(tags::escape(&format!(
+                    "IMAP error: {e}"
+                ))));
             }
             Ok(folder_infos) => {
                 // Rebuild folder display-name mappings.
@@ -1604,7 +1623,7 @@ impl EmailClientProvider {
                     let display = folder_display_name(&info.name).to_owned();
                     self.folder_mappings
                         .push((display.clone(), info.name.clone()));
-                    items.push(FfonElement::new_obj(display.clone()));
+                    items.push(FfonElement::new_obj(tags::escape(&display)));
                     // Insert compose right after INBOX.
                     if !compose_inserted && info.name.to_uppercase() == "INBOX" {
                         items.push(FfonElement::new_obj("compose"));
@@ -1789,7 +1808,9 @@ impl EmailClientProvider {
         };
 
         match folder_result {
-            Err(e) => items.push(FfonElement::new_str(format!("IMAP error: {e}"))),
+            Err(e) => items.push(FfonElement::new_str(tags::escape(&format!(
+                "IMAP error: {e}"
+            )))),
             Ok(headers) => {
                 items = envelope_items(&headers, limit);
                 self.message_cache = headers;
@@ -1864,7 +1885,9 @@ impl EmailClientProvider {
                 return vec![FfonElement::new_str("(message not found)".to_owned())];
             }
             MessageState::Failed(e) => {
-                return vec![FfonElement::new_str(format!("IMAP error: {e}"))];
+                return vec![FfonElement::new_str(tags::escape(&format!(
+                    "IMAP error: {e}"
+                )))];
             }
         };
 
@@ -1949,10 +1972,7 @@ impl EmailClientProvider {
                     .into_iter()
                     .map(
                         |other_uid| match self.message_cache.iter().find(|h| h.uid == other_uid) {
-                            Some(h) => HistoryItem::Label(format!(
-                                "From: {} — Subject: {}",
-                                h.from, h.subject
-                            )),
+                            Some(h) => HistoryItem::Label(history_row(&h.from, &h.subject)),
                             None => HistoryItem::FetchUid(other_uid),
                         },
                     )
@@ -2018,7 +2038,7 @@ impl EmailClientProvider {
                     HistoryItem::FetchUid(uid) => {
                         let folder = folders.first().cloned().unwrap_or_default();
                         if let Ok(Some(msg)) = guard.fetch_message(&folder, uid).await {
-                            labels.push(format!("From: {} — Subject: {}", msg.from, msg.subject));
+                            labels.push(history_row(&msg.from, &msg.subject));
                         }
                     }
                     HistoryItem::FetchMessageId(msg_id) => {
@@ -2026,8 +2046,7 @@ impl EmailClientProvider {
                             if let Ok(Some(msg)) =
                                 guard.fetch_message_by_message_id(folder, &msg_id).await
                             {
-                                labels
-                                    .push(format!("From: {} — Subject: {}", msg.from, msg.subject));
+                                labels.push(history_row(&msg.from, &msg.subject));
                                 break;
                             }
                         }
@@ -2107,7 +2126,7 @@ impl EmailClientProvider {
                         .message_cache
                         .iter()
                         .find(|h| h.uid == other_uid)
-                        .map(|h| format!("From: {} — Subject: {}", h.from, h.subject));
+                        .map(|h| history_row(&h.from, &h.subject));
                     if let Some(lbl) = label {
                         items.push(FfonElement::new_obj(lbl));
                     } else if let Some(ref mut imap) = self.imap {
@@ -2115,10 +2134,7 @@ impl EmailClientProvider {
                         let uid_str = other_uid.to_string();
                         if let Ok(Some(msg)) = block_on(imap.fetch_message(&folder, other_uid)) {
                             let _ = uid_str;
-                            items.push(FfonElement::new_obj(format!(
-                                "From: {} — Subject: {}",
-                                msg.from, msg.subject
-                            )));
+                            items.push(FfonElement::new_obj(history_row(&msg.from, &msg.subject)));
                         }
                     }
                 }
@@ -2169,7 +2185,7 @@ impl EmailClientProvider {
                     && let Ok(Some(msg)) =
                         block_on(imap.fetch_message_by_message_id(search_folder, msg_id))
                 {
-                    let key = format!("From: {} — Subject: {}", msg.from, msg.subject);
+                    let key = history_row(&msg.from, &msg.subject);
                     items.push(FfonElement::new_obj(key));
                     count += 1;
                     break 'search;
@@ -2225,25 +2241,25 @@ impl EmailClientProvider {
 
         let mut items = vec![];
         // Static "From:" line.
-        items.push(FfonElement::new_str(format!(
+        items.push(FfonElement::new_str(tags::escape(&format!(
             "From: {}",
             self.config.username
-        )));
+        ))));
         items.push(FfonElement::new_str(format!(
             "To: <input>{}</input>",
-            self.compose.draft.to
+            tags::escape(&self.compose.draft.to)
         )));
         items.push(FfonElement::new_str(format!(
             "Cc: <input>{}</input>",
-            self.compose.draft.cc
+            tags::escape(&self.compose.draft.cc)
         )));
         items.push(FfonElement::new_str(format!(
             "Bcc: <input>{}</input>",
-            self.compose.draft.bcc
+            tags::escape(&self.compose.draft.bcc)
         )));
         items.push(FfonElement::new_str(format!(
             "Subject: <input>{}</input>",
-            self.compose.draft.subject
+            tags::escape(&self.compose.draft.subject)
         )));
 
         // Attachments: list current files, then an empty input for adding more.
@@ -2252,7 +2268,7 @@ impl EmailClientProvider {
             .draft
             .attachments
             .iter()
-            .map(|p| FfonElement::new_str(p.clone()))
+            .map(|p| FfonElement::new_str(tags::escape(p)))
             .collect();
         attach_children.push(FfonElement::new_str("<input></input>".to_owned()));
         items.push(FfonElement::Obj(FfonObject {
@@ -2631,7 +2647,9 @@ fn build_draft_bytes(draft: &Draft, from: &str) -> Vec<u8> {
     msg.push_str("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n");
     let body_text = match &draft.body {
         MailBody::Text(s) => s.clone(),
-        MailBody::Ffon(elems) => sicompass_sdk::ffon::to_json_string(elems).unwrap_or_default(),
+        MailBody::Ffon(elems) => {
+            sicompass_sdk::ffon::to_json_string(&escape::wire_rows(elems)).unwrap_or_default()
+        }
     };
     msg.push_str(&body_text);
     msg.into_bytes()
@@ -2651,6 +2669,13 @@ fn extract_email_addr(s: &str) -> &str {
         return s[lt + 1..gt].trim();
     }
     s.trim()
+}
+
+/// One header of a forwarded message, as a leaf of a structured draft.
+fn forwarded_header_row(name: &str, value: &str) -> FfonElement {
+    FfonElement::new_str(tags::format_input(&tags::escape(&format!(
+        "{name}: {value}"
+    ))))
 }
 
 fn prefill_compose(
@@ -2683,6 +2708,7 @@ fn prefill_compose(
                 // are prepended as plain text; body_to_compose_children will
                 // render the whole blob as one editable <input> leaf.
                 MailBody::Text(s) => {
+                    let s = escape::strip_link_marks(s);
                     let mut draft = format!("On {} <{}> wrote:\n", msg.date, msg.from);
                     for l in s.lines() {
                         draft.push_str("> ");
@@ -2694,13 +2720,15 @@ fn prefill_compose(
                 // FFON-origin: preserve structure. Flat I_PLACEHOLDER +
                 // attribution leaf + seeded original elements.
                 MailBody::Ffon(orig) => {
-                    let attribution =
-                        format!("<input>On {} <{}> wrote:</input>", msg.date, msg.from);
+                    let attribution = tags::format_input(&tags::escape(&format!(
+                        "On {} <{}> wrote:",
+                        msg.date, msg.from
+                    )));
                     let mut elems = vec![
                         FfonElement::new_str(I_PLACEHOLDER.to_owned()),
                         FfonElement::new_str(attribution),
                     ];
-                    let mut orig_cloned = orig.clone();
+                    let mut orig_cloned = escape::compose_rows(orig);
                     seed_i_placeholders(&mut orig_cloned);
                     elems.extend(orig_cloned);
                     MailBody::Ffon(elems)
@@ -2718,6 +2746,7 @@ fn prefill_compose(
                 // Text-origin: keep as text. Forwarded-header block + original
                 // body as plain text; rendered as one editable <input> leaf.
                 MailBody::Text(s) => {
+                    let s = escape::strip_link_marks(s);
                     let mut draft = format!(
                         "---------- Forwarded message ----------\nFrom: {}\nTo: {}\nDate: {}\nSubject: {}\n\n{}",
                         msg.from, msg.to, msg.date, msg.subject, s
@@ -2734,14 +2763,14 @@ fn prefill_compose(
                         FfonElement::new_str(
                             "<input>---------- Forwarded message ----------</input>".to_owned(),
                         ),
-                        FfonElement::new_str(format!("<input>From: {}</input>", msg.from)),
-                        FfonElement::new_str(format!("<input>To: {}</input>", msg.to)),
-                        FfonElement::new_str(format!("<input>Date: {}</input>", msg.date)),
-                        FfonElement::new_str(format!("<input>Subject: {}</input>", msg.subject)),
+                        forwarded_header_row("From", &msg.from),
+                        forwarded_header_row("To", &msg.to),
+                        forwarded_header_row("Date", &msg.date),
+                        forwarded_header_row("Subject", &msg.subject),
                     ];
                     let mut elems = vec![FfonElement::new_str(I_PLACEHOLDER.to_owned())];
                     elems.extend(fwd_header);
-                    let mut orig_cloned = orig.clone();
+                    let mut orig_cloned = escape::compose_rows(orig);
                     seed_i_placeholders(&mut orig_cloned);
                     elems.extend(orig_cloned);
                     MailBody::Ffon(elems)
@@ -2758,19 +2787,19 @@ fn prefill_compose(
 
 fn build_message_view(msg: &EmailMessage) -> Vec<FfonElement> {
     let mut items = vec![
-        FfonElement::new_str(format!("From: {}", msg.from)),
-        FfonElement::new_str(format!("To: {}", msg.to)),
-        FfonElement::new_str(format!("Date: {}", msg.date)),
-        FfonElement::new_str(format!("Subject: {}", msg.subject)),
+        FfonElement::new_str(tags::escape(&format!("From: {}", msg.from))),
+        FfonElement::new_str(tags::escape(&format!("To: {}", msg.to))),
+        FfonElement::new_str(tags::escape(&format!("Date: {}", msg.date))),
+        FfonElement::new_str(tags::escape(&format!("Subject: {}", msg.subject))),
     ];
 
     // Render body according to its kind.
     match &msg.body {
         MailBody::Text(s) => {
-            items.push(FfonElement::new_str(s.clone()));
+            items.push(FfonElement::new_str(escape::text_row(s)));
         }
         MailBody::Ffon(elems) => {
-            items.extend(elems.clone());
+            items.extend(escape::received_rows(elems));
         }
     }
 
@@ -2782,12 +2811,12 @@ fn build_message_view(msg: &EmailMessage) -> Vec<FfonElement> {
                 .attachments
                 .iter()
                 .map(|a| {
-                    FfonElement::new_str(format!(
+                    FfonElement::new_str(tags::escape(&format!(
                         "{} ({}, {} bytes)",
                         a.filename,
                         a.content_type,
                         a.data.len()
-                    ))
+                    )))
                 })
                 .collect();
         }
@@ -2823,17 +2852,22 @@ fn body_from_ffon_children(children: &[FfonElement]) -> MailBody {
     // A single plain Str with an <input> tag is the Text representation.
     if children.len() == 1
         && let FfonElement::Str(s) = &children[0]
-        && let Some(content) = sicompass_sdk::tags::extract_input(s)
+        && let Some(content) = tags::extract_input(s)
     {
-        return MailBody::Text(content);
+        return MailBody::Text(escape::unescape(&content));
     }
     MailBody::Ffon(children.to_vec())
+}
+
+/// An editable leaf of a draft holding `text`.
+fn text_leaf(text: &str) -> FfonElement {
+    FfonElement::new_str(tags::format_input(&tags::escape(text)))
 }
 
 fn body_to_compose_children(body: &MailBody) -> Vec<FfonElement> {
     match body {
         MailBody::Text(s) if !s.is_empty() => {
-            vec![FfonElement::new_str(format!("<input>{s}</input>"))]
+            vec![text_leaf(s)]
         }
         MailBody::Text(_) => vec![],
         MailBody::Ffon(elems) => elems.clone(),
@@ -2847,8 +2881,6 @@ fn body_to_compose_children(body: &MailBody) -> Vec<FfonElement> {
 /// When no match is found the new content is appended (handles the case where the
 /// placeholder was inserted locally in the FFON tree but not yet committed).
 fn update_body_elems(elems: &mut Vec<FfonElement>, old_content: &str, new_content: &str) {
-    use sicompass_sdk::tags;
-
     let is_obj_create = new_content.ends_with(':');
     let obj_key = if is_obj_create {
         new_content.trim_end_matches(':').trim()
@@ -2867,18 +2899,16 @@ fn update_body_elems(elems: &mut Vec<FfonElement>, old_content: &str, new_conten
 
     if is_obj_create && !obj_key.is_empty() {
         if let Some(idx) = pos {
-            elems[idx] = new_obj_with_i_placeholder(format!("<input>{obj_key}</input>"));
+            elems[idx] = new_obj_with_i_placeholder(tags::format_input(&tags::escape(obj_key)));
         } else {
-            elems.push(new_obj_with_i_placeholder(format!(
-                "<input>{obj_key}</input>"
+            elems.push(new_obj_with_i_placeholder(tags::format_input(
+                &tags::escape(obj_key),
             )));
         }
     } else if let Some(idx) = pos {
-        elems[idx] = FfonElement::new_str(format!("<input>{new_content}</input>"));
+        elems[idx] = text_leaf(new_content);
     } else {
-        elems.push(FfonElement::new_str(format!(
-            "<input>{new_content}</input>"
-        )));
+        elems.push(text_leaf(new_content));
     }
 }
 
@@ -2959,19 +2989,16 @@ fn update_body_leaf(body: &mut MailBody, old_content: &str, new_content: &str) {
                 let mut elems: Vec<FfonElement> = if existing.is_empty() {
                     vec![]
                 } else {
-                    vec![FfonElement::new_str(format!("<input>{existing}</input>"))]
+                    vec![text_leaf(&existing)]
                 };
-                elems.push(new_obj_with_i_placeholder(format!(
-                    "<input>{obj_key}</input>"
+                elems.push(new_obj_with_i_placeholder(tags::format_input(
+                    &tags::escape(obj_key),
                 )));
                 *body = MailBody::Ffon(elems);
             } else if old_content.is_empty() && !s.is_empty() {
                 // A new element is being inserted alongside existing content — upgrade to Ffon.
                 let existing = s.clone();
-                *body = MailBody::Ffon(vec![
-                    FfonElement::new_str(format!("<input>{existing}</input>")),
-                    FfonElement::new_str(format!("<input>{new_content}</input>")),
-                ]);
+                *body = MailBody::Ffon(vec![text_leaf(&existing), text_leaf(new_content)]);
             } else {
                 // Simple replacement.
                 *s = new_content.to_owned();
@@ -3053,7 +3080,7 @@ fn body_add_element(body: &mut MailBody) {
         MailBody::Text(s) => {
             let existing = s.clone();
             *body = MailBody::Ffon(vec![
-                FfonElement::new_str(format!("<input>{existing}</input>")),
+                text_leaf(&existing),
                 FfonElement::new_str("<input></input>".to_owned()),
             ]);
         }
@@ -3067,18 +3094,16 @@ fn body_add_element(body: &mut MailBody) {
 ///
 /// - Single-element `Ffon([Str("<input>text</input>")])` → `Text(text)`.
 /// - `Text` that parses as valid FFON JSON → `Ffon(parsed)`.
-/// - Everything else: unchanged.
+/// - Everything else: unchanged, in the form a message carries, with no escapes.
 fn normalize_body_for_send(body: &MailBody) -> MailBody {
-    use sicompass_sdk::tags;
-
     match body {
         MailBody::Ffon(elems) if elems.len() == 1 => {
             if let FfonElement::Str(s) = &elems[0] {
-                let plain = tags::extract_input(s).unwrap_or_else(|| s.clone());
+                let plain = escape::unescape(&tags::extract_input(s).unwrap_or_else(|| s.clone()));
                 // Collapse single-element Ffon back to Text (or re-detect as Ffon).
-                return normalize_body_for_send(&MailBody::Text(plain.to_owned()));
+                return normalize_body_for_send(&MailBody::Text(plain));
             }
-            body.clone()
+            MailBody::Ffon(escape::wire_rows(elems))
         }
         MailBody::Text(s) => {
             // Try FFON detection.
@@ -3091,7 +3116,7 @@ fn normalize_body_for_send(body: &MailBody) -> MailBody {
             }
             body.clone()
         }
-        _ => body.clone(),
+        MailBody::Ffon(elems) => MailBody::Ffon(escape::wire_rows(elems)),
     }
 }
 
@@ -3110,14 +3135,14 @@ fn body_format_label(body: &MailBody) -> &'static str {
 /// the insertion affordance stays visible in the compose view after the body
 /// is emptied by deleting all children.
 fn renormalize_body_variant(body: &mut MailBody) {
-    use sicompass_sdk::tags;
     if let MailBody::Ffon(elems) = body
         && elems.len() == 1
         && let FfonElement::Str(raw) = &elems[0]
         && raw != I_PLACEHOLDER
     {
-        let plain = tags::extract_input(raw).unwrap_or_else(|| raw.clone());
-        *body = MailBody::Text(plain);
+        *body = MailBody::Text(escape::unescape(
+            &tags::extract_input(raw).unwrap_or_else(|| raw.clone()),
+        ));
     }
 }
 
@@ -3133,7 +3158,7 @@ fn detect_body_format_live(body: MailBody) -> MailBody {
                 && sicompass_sdk::ffon::is_ffon(&v)
                 && let Ok(elems) = serde_json::from_value::<Vec<FfonElement>>(v)
             {
-                return MailBody::Ffon(elems);
+                return MailBody::Ffon(escape::compose_rows(&elems));
             }
             body
         }
@@ -3387,6 +3412,8 @@ impl EmailClientProvider {
     }
 
     pub fn commit_edit(&mut self, old_content: &str, new_content: &str) -> bool {
+        let new_content = escape::typed_value(old_content, new_content);
+        let new_content = new_content.as_str();
         // Collect path segments as owned strings so we can freely mutate `self` later.
         let segs: Vec<String> = self
             .current_path
@@ -3579,8 +3606,8 @@ impl EmailClientProvider {
                 .unwrap_or(&self.envelope_cache_folder);
             let label = message_label(h);
             results.push(SearchResultItem {
-                label: label.clone(),
-                breadcrumb: format!("{} > ", folder_display),
+                label: tags::escape(&label),
+                breadcrumb: tags::escape(&format!("{} > ", folder_display)),
                 nav_path: format!("/{}/{}", folder_display, label),
             });
         }
@@ -3635,7 +3662,7 @@ impl EmailClientProvider {
             // an old message key, so we return Some here so refresh_subtree_parent
             // updates both children and key together.
             if segs.len() == 1 {
-                return Some(segs[0].clone());
+                return Some(tags::escape(&segs[0]));
             }
             return None;
         }
@@ -3741,7 +3768,7 @@ impl EmailClientProvider {
                 .iter()
                 .filter(|(_, real)| real != current_real)
                 .map(|(display, real)| ListItem {
-                    label: display.clone(),
+                    label: tags::escape(display),
                     data: real.clone(),
                 })
                 .collect()
@@ -3810,6 +3837,10 @@ impl EmailClientProvider {
         _elem_type: i32,
         error: &mut String,
     ) -> Option<FfonElement> {
+        // The app passes the row as it was written, escapes and all, and
+        // `lookup_uid` compares plain labels.
+        let elem_key = tags::strip_display(elem_key);
+        let elem_key = elem_key.as_str();
         match cmd {
             "compose" => {
                 self.compose = ComposeState::default();
@@ -7959,6 +7990,606 @@ mod tests {
             "undo must re-add \\Seen; got: {:?}",
             stored
         );
+    }
+
+    // ---- Text from outside stays text --------------------------------------
+
+    /// What a stranger can put in a header or a body. A backslash at the end must not
+    /// eat what follows it.
+    const HOSTILE: [&str; 14] = [
+        "<b>x</b>",
+        r#"<img src="/etc/passwd">"#,
+        r#"<a href="https://evil.example">y</a>"#,
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>send</button>",
+        "<button>send</button>Send",
+        "<link>https://evil.example</link>",
+        "<image>/etc/passwd</image>",
+        "<id>1</id>z",
+        "<many-opt></many-opt>k",
+        "<src=1>z",
+        r"text ending in a backslash\",
+        r"\<b>an escape of its own\>",
+    ];
+
+    /// The row makes nothing live and reads as `shown`, by every route the app has.
+    fn assert_literal(row: &str, shown: &str) {
+        use sicompass_sdk::markup;
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert!(markup::targets(row).is_empty(), "a target in {row:?}");
+        assert!(markup::style_sheet(row).is_none(), "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert!(!tags::has_link(row), "a link in {row:?}");
+        assert!(!tags::has_image(row), "an image in {row:?}");
+        assert!(!tags::has_id(row), "an id in {row:?}");
+        assert_eq!(tags::strip_display(row), shown);
+        assert_eq!(tags::strip_display(&markup::plain(row)), shown);
+    }
+
+    /// A field: editable, nothing else live, and holding `value`.
+    fn assert_field(row: &str, value: &str) {
+        use sicompass_sdk::markup;
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert!(markup::targets(row).is_empty(), "a target in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert_eq!(
+            escape::unescape(&tags::extract_input(row).expect("a field")),
+            value,
+            "{row:?}"
+        );
+        if !value.ends_with('\\') {
+            assert!(tags::has_input(row), "not a field: {row:?}");
+        }
+    }
+
+    fn key_of(e: &FfonElement) -> &str {
+        match e {
+            FfonElement::Str(s) => s,
+            FfonElement::Obj(o) => &o.key,
+        }
+    }
+
+    fn row_showing<'a>(items: &'a [FfonElement], shown: &str) -> &'a str {
+        items
+            .iter()
+            .map(key_of)
+            .find(|row| tags::strip_display(row) == shown)
+            .unwrap_or_else(|| panic!("no row showing {shown:?} in {items:?}"))
+    }
+
+    #[test]
+    fn a_folder_lists_every_subject_and_sender_literally() {
+        for text in HOSTILE {
+            let imap = MockImap::new().with_messages(vec![make_header(1, text, text)]);
+            let mut p = EmailClientProvider::new().with_imap(Box::new(imap));
+            p.push_path("INBOX");
+            let items = p.fetch();
+            assert_literal(key_of(&items[0]), &format!("[read] {text} — {text}"));
+        }
+    }
+
+    #[test]
+    fn a_message_shows_every_header_body_and_attachment_literally() {
+        for text in HOSTILE {
+            let mut msg = make_message(1);
+            msg.from = text.to_owned();
+            msg.to = text.to_owned();
+            msg.date = text.to_owned();
+            msg.subject = text.to_owned();
+            msg.body = MailBody::Text(text.to_owned());
+            msg.attachments = vec![EmailAttachment {
+                filename: text.to_owned(),
+                content_type: text.to_owned(),
+                data: vec![0; 3],
+            }];
+            let items = build_message_view(&msg);
+            for label in ["From", "To", "Date", "Subject"] {
+                let shown = format!("{label}: {text}");
+                assert_literal(row_showing(&items, &shown), &shown);
+            }
+            assert_literal(row_showing(&items, text), text);
+            let attachments = items
+                .iter()
+                .find_map(|e| e.as_obj().filter(|o| o.key == "Attachments"))
+                .expect("the attachments");
+            let shown = format!("{text} ({text}, 3 bytes)");
+            assert_literal(key_of(&attachments.children[0]), &shown);
+        }
+    }
+
+    /// The whole way through the provider, for a subject that is one path segment.
+    #[test]
+    fn a_message_with_brackets_in_its_subject_can_be_opened_from_its_row() {
+        let subject = "<b>x";
+        let mut msg = make_message(1);
+        msg.subject = subject.to_owned();
+        msg.body = MailBody::Text("<img src=\"secret.png\">".to_owned());
+        let imap = MockImap::new()
+            .with_messages(vec![make_header(1, "a@b", subject)])
+            .with_detail(msg);
+        let mut p = EmailClientProvider::new().with_imap(Box::new(imap));
+        p.push_path("INBOX");
+        let rows = p.fetch();
+        let row = key_of(&rows[0]).to_owned();
+        assert_eq!(row, r"[read] \<b\>x — a@b");
+
+        p.push_path(&tags::strip_display(&row));
+        let inside = p.fetch();
+        assert_literal(row_showing(&inside, "Subject: <b>x"), "Subject: <b>x");
+        assert_literal(
+            row_showing(&inside, "<img src=\"secret.png\">"),
+            "<img src=\"secret.png\">",
+        );
+    }
+
+    /// The app hands a command the row as it was written.
+    #[test]
+    fn a_command_finds_its_message_from_the_escaped_row() {
+        for text in HOSTILE {
+            let imap = MockImap::new().with_messages(vec![make_header(1, text, text)]);
+            let mut p = EmailClientProvider::new().with_imap(Box::new(imap));
+            p.push_path("INBOX");
+            let rows = p.fetch();
+            let row = key_of(&rows[0]).to_owned();
+            let mut error = String::new();
+            p.handle_command("star", &row, 1, &mut error);
+            assert_eq!(error, "", "{row:?}");
+            assert!(p.message_cache[0].flagged, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn folder_names_are_literal_in_the_root_the_parent_key_and_the_move_list() {
+        for name in ["<b>x", "<input>y", "<button>send", r"ends in a backslash\"] {
+            let imap = MockImap::new().with_folders(&["INBOX", name]);
+            let mut p = EmailClientProvider::new()
+                .with_oauth_token("fake")
+                .with_imap(Box::new(imap));
+            let items = p.fetch();
+            assert_literal(row_showing(&items, name), name);
+
+            let moves = p.command_list_items("move");
+            let item = moves
+                .iter()
+                .find(|i| i.data == name)
+                .expect("the folder in the move list");
+            assert_literal(&item.label, name);
+
+            p.push_path(name);
+            let key = p.fetch_subtree_parent_key().expect("the parent key");
+            assert_literal(&key, name);
+        }
+    }
+
+    #[test]
+    fn an_imap_error_quoting_the_server_is_literal() {
+        for text in HOSTILE {
+            let mut p = EmailClientProvider::new()
+                .with_oauth_token("fake")
+                .with_imap(Box::new(MockImap::new().with_error(text)));
+            let shown = format!("IMAP error: {text}");
+            let root = p.fetch();
+            assert_literal(row_showing(&root, &shown), &shown);
+            p.push_path("INBOX");
+            let folder = p.fetch();
+            assert_literal(row_showing(&folder, &shown), &shown);
+        }
+    }
+
+    #[test]
+    fn the_history_view_is_literal() {
+        for text in HOSTILE {
+            let mut msg = make_message(1);
+            msg.references = "<prev@example.com>".to_owned();
+            let mut earlier = make_message(0);
+            earlier.from = text.to_owned();
+            earlier.subject = text.to_owned();
+            let imap = MockImap::new()
+                .with_messages(vec![make_header(1, "alice@example.com", "Hello")])
+                .with_detail(msg)
+                .with_by_msg_id(earlier);
+            let mut p = EmailClientProvider::new().with_imap(Box::new(imap));
+            p.push_path("INBOX");
+            p.fetch();
+            p.push_path("[read] Hello — alice@example.com");
+            p.fetch();
+            p.push_path("History");
+            let items = p.fetch();
+            let shown = format!("From: {text} — Subject: {text}");
+            assert_literal(row_showing(&items, &shown), &shown);
+        }
+    }
+
+    #[test]
+    fn extended_search_labels_are_literal_and_navigate_plain() {
+        let text = "<b>x";
+        let mut p = bg_provider_in_inbox();
+        p.message_cache = vec![make_header(1, text, text)];
+        let items = p.collect_extended_search_items().expect("the items");
+        let label = message_label(&p.message_cache[0]);
+        assert_literal(&items[0].label, &label);
+        assert_eq!(items[0].nav_path, format!("/INBOX/{label}"));
+    }
+
+    /// Fill a new draft's fields the way the app does, and read them back from the rows.
+    fn draft_with(text: &str) -> EmailClientProvider {
+        let mut p = EmailClientProvider::new().with_smtp(Box::new(MockSmtp::new()));
+        p.push_path("compose");
+        for field in ["To", "Cc", "Bcc", "Subject", "Body:", "Attachments:"] {
+            p.push_path(field);
+            assert!(p.commit_edit("", text), "{field}");
+            p.current_path = "/compose".to_owned();
+        }
+        p
+    }
+
+    #[test]
+    fn a_compose_form_holds_what_was_typed_and_shows_it_literally() {
+        for text in HOSTILE {
+            let mut p = draft_with(text);
+            assert_eq!(p.compose.draft.to, text);
+            assert_eq!(p.compose.draft.cc, text);
+            assert_eq!(p.compose.draft.bcc, text);
+            assert_eq!(p.compose.draft.subject, text);
+            assert!(matches!(&p.compose.draft.body, MailBody::Text(s) if s == text));
+            assert_eq!(p.compose.draft.attachments, [text.trim()]);
+
+            let items = p.fetch();
+            for (i, label) in ["To", "Cc", "Bcc", "Subject"].iter().enumerate() {
+                let row = key_of(&items[i + 1]);
+                assert!(row.starts_with(&format!("{label}: <input>")), "{row:?}");
+                assert_field(row, text);
+            }
+            let body = items
+                .iter()
+                .find_map(|e| e.as_obj().filter(|o| o.key.starts_with("Body:")))
+                .expect("the body");
+            assert_field(key_of(&body.children[0]), text);
+            let attachments = items
+                .iter()
+                .find_map(|e| e.as_obj().filter(|o| o.key == "Attachments:"))
+                .expect("the attachments");
+            assert_literal(key_of(&attachments.children[0]), text.trim());
+        }
+    }
+
+    #[test]
+    fn the_sign_in_address_in_a_compose_form_is_literal() {
+        let mut p = EmailClientProvider::new();
+        p.config.username = "<b>x</b>".to_owned();
+        p.push_path("compose");
+        let items = p.fetch();
+        assert_literal(key_of(&items[0]), "From: <b>x</b>");
+    }
+
+    /// Enter on a field outside Insert mode commits it, and the app passes the raw
+    /// value out of the row as both `old` and `new`.
+    #[test]
+    fn enter_on_a_field_does_not_add_a_backslash() {
+        for text in HOSTILE {
+            let mut p = draft_with(text);
+            let raw = tags::escape(text);
+            p.push_path("Subject");
+            assert!(p.commit_edit(&raw, &raw));
+            assert_eq!(p.compose.draft.subject, text);
+            p.current_path = "/compose/Body:".to_owned();
+            assert!(p.commit_edit(&raw, &raw));
+            assert!(
+                matches!(&p.compose.draft.body, MailBody::Text(s) if s == text),
+                "{:?}",
+                p.compose.draft.body
+            );
+        }
+    }
+
+    #[test]
+    fn a_sent_message_and_a_saved_draft_hold_the_original_bytes() {
+        for text in HOSTILE {
+            let smtp = MockSmtp::new();
+            let sent = smtp.sent.clone();
+            let mut p = EmailClientProvider::new().with_smtp(Box::new(smtp));
+            p.push_path("compose");
+            p.compose.draft.to = text.to_owned();
+            p.compose.draft.subject = text.to_owned();
+            p.compose.draft.body = MailBody::Text(text.to_owned());
+
+            let bytes = String::from_utf8(build_draft_bytes(&p.compose.draft, "me@x")).unwrap();
+            assert!(bytes.contains(&format!("Subject: {text}\r\n")), "{bytes}");
+            assert!(bytes.ends_with(text), "{bytes}");
+
+            p.on_button_press("send");
+            let sent = sent.lock().unwrap();
+            let (_, to, subject, body) = &sent[0];
+            assert_eq!(to, text);
+            assert_eq!(subject, text);
+            assert!(matches!(body, MailBody::Text(s) if s == text), "{body:?}");
+        }
+    }
+
+    /// Lines of a structured body, added and edited through the form.
+    #[test]
+    fn a_structured_draft_shows_escapes_and_sends_none() {
+        for text in HOSTILE.into_iter().filter(|t| !t.ends_with('\\')) {
+            let smtp = MockSmtp::new();
+            let sent = smtp.sent.clone();
+            let mut p = EmailClientProvider::new().with_smtp(Box::new(smtp));
+            p.push_path("compose");
+            p.push_path("Body:");
+            assert!(p.commit_edit("", text));
+            // A second line makes the body structured.
+            assert!(p.commit_edit("", text));
+            let MailBody::Ffon(elems) = &p.compose.draft.body else {
+                panic!("structured: {:?}", p.compose.draft.body);
+            };
+            let rows: Vec<String> = elems.iter().map(|e| key_of(e).to_owned()).collect();
+            assert_eq!(rows.len(), 2);
+            for row in &rows {
+                assert_field(row, text);
+            }
+
+            // Edit the second: the row's raw value finds it, and it holds the new text.
+            let raw = tags::extract_input(&rows[1]).unwrap();
+            let edited = format!("{text} edited");
+            assert!(p.commit_edit(&raw, &edited));
+            let on_wire = |p: &EmailClientProvider| {
+                sicompass_sdk::ffon::to_json_string(&escape::wire_rows(
+                    match &p.compose.draft.body {
+                        MailBody::Ffon(e) => e,
+                        other => panic!("structured: {other:?}"),
+                    },
+                ))
+                .unwrap()
+            };
+            let wire = on_wire(&p);
+            let expected = serde_json::json!([
+                format!("<input>{edited}</input>"),
+                format!("<input>{text}</input>"),
+            ]);
+            let got: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(
+                got.as_array().map(Vec::len),
+                Some(2),
+                "two lines, one edited: {got}"
+            );
+            for line in expected.as_array().unwrap() {
+                assert!(got.as_array().unwrap().contains(line), "{line} in {got}");
+            }
+
+            p.compose.draft.to = "a@b".to_owned();
+            let bytes = String::from_utf8(build_draft_bytes(&p.compose.draft, "me@x")).unwrap();
+            assert!(bytes.ends_with(&wire), "{bytes}");
+
+            p.on_button_press("send");
+            let sent = sent.lock().unwrap();
+            let MailBody::Ffon(elems) = &sent[0].3 else {
+                panic!("structured: {:?}", sent[0].3);
+            };
+            let sent_json: serde_json::Value =
+                serde_json::from_str(&sicompass_sdk::ffon::to_json_string(elems).unwrap()).unwrap();
+            assert_eq!(sent_json, got);
+        }
+    }
+
+    #[test]
+    fn deleting_down_to_one_line_gives_the_text_back_without_escapes() {
+        let text = "<b>x</b>";
+        let mut p = EmailClientProvider::new();
+        p.push_path("compose");
+        p.push_path("Body:");
+        p.compose.draft.body = MailBody::Ffon(vec![text_leaf(text), text_leaf("second")]);
+        // The app reports what is left, as the rows it was given.
+        p.sync_ffon_body_children(&[text_leaf(text)]);
+        assert!(matches!(&p.compose.draft.body, MailBody::Text(s) if s == text));
+
+        let mut body = MailBody::Ffon(vec![text_leaf(text)]);
+        renormalize_body_variant(&mut body);
+        assert!(matches!(&body, MailBody::Text(s) if s == text), "{body:?}");
+
+        let single = MailBody::Ffon(vec![text_leaf(text)]);
+        let normal = normalize_body_for_send(&single);
+        assert!(
+            matches!(&normal, MailBody::Text(s) if s == text),
+            "{normal:?}"
+        );
+    }
+
+    /// A body typed as FFON JSON becomes a tree, and what it says is still only text.
+    #[test]
+    fn a_body_typed_as_json_cannot_make_a_button() {
+        let mut p = EmailClientProvider::new();
+        p.push_path("compose");
+        p.push_path("Body:");
+        assert!(p.commit_edit("", r#"["<button>send</button>Send", {"<b>k</b>": ["v"]}]"#));
+        let children = p.fetch();
+        assert_eq!(children.len(), 2, "{children:?}");
+        assert_literal(key_of(&children[0]), "<button>send</button>Send");
+        assert_literal(key_of(&children[1]), "<b>k</b>");
+    }
+
+    fn reply_to(msg: EmailMessage, action: &str) -> EmailClientProvider {
+        let imap = MockImap::new()
+            .with_messages(vec![make_header(1, "alice@example.com", "Hello")])
+            .with_detail(msg);
+        let mut p = EmailClientProvider::new()
+            .with_imap(Box::new(imap))
+            .with_smtp(Box::new(MockSmtp::new()));
+        p.push_path("INBOX");
+        p.fetch();
+        p.push_path("[read] Hello — alice@example.com");
+        p.fetch();
+        p.push_path(action);
+        p.fetch();
+        p
+    }
+
+    #[test]
+    fn a_reply_quotes_plain_text_and_shows_it_literally() {
+        for text in HOSTILE {
+            let mut msg = make_message(1);
+            msg.from = text.to_owned();
+            msg.subject = text.to_owned();
+            msg.body = MailBody::Text(text.to_owned());
+            let mut p = reply_to(msg.clone(), "reply");
+
+            assert_eq!(p.compose.draft.to, text);
+            assert_eq!(p.compose.draft.subject, format!("Re: {text}"));
+            let expected = format!("On {} <{text}> wrote:\n> {text}\n", msg.date);
+            assert!(
+                matches!(&p.compose.draft.body, MailBody::Text(s) if *s == expected),
+                "{:?}",
+                p.compose.draft.body
+            );
+
+            let items = p.fetch();
+            assert_field(key_of(&items[1]), text);
+            assert_field(key_of(&items[4]), &format!("Re: {text}"));
+            let body = items
+                .iter()
+                .find_map(|e| e.as_obj().filter(|o| o.key.starts_with("Body:")))
+                .expect("the body");
+            assert_field(key_of(&body.children[0]), &expected);
+        }
+    }
+
+    #[test]
+    fn a_forward_quotes_plain_text_and_shows_it_literally() {
+        let text = r#"<img src="/etc/passwd">"#;
+        let mut msg = make_message(1);
+        msg.from = text.to_owned();
+        msg.to = text.to_owned();
+        msg.subject = text.to_owned();
+        msg.body = MailBody::Text(text.to_owned());
+        let mut p = reply_to(msg, "forward");
+        let MailBody::Text(body) = p.compose.draft.body.clone() else {
+            panic!("text");
+        };
+        assert!(body.contains(&format!("From: {text}\n")), "{body}");
+        assert!(!body.contains('\\'), "{body}");
+        let items = p.fetch();
+        let compose_body = items
+            .iter()
+            .find_map(|e| e.as_obj().filter(|o| o.key.starts_with("Body:")))
+            .expect("the body");
+        assert_field(key_of(&compose_body.children[0]), &body);
+    }
+
+    /// A tree a stranger sent: a message shows every string as text, a person's leaf
+    /// included, which `<input>` wraps on the wire.
+    #[test]
+    fn a_received_tree_is_all_text() {
+        for text in HOSTILE {
+            let mut obj = FfonElement::new_obj(text.to_owned());
+            obj.as_obj_mut()
+                .unwrap()
+                .push(FfonElement::new_str(text.to_owned()));
+            let mut msg = make_message(1);
+            msg.body = MailBody::Ffon(vec![FfonElement::new_str(text.to_owned()), obj]);
+            let items = build_message_view(&msg);
+            // From, To, Date and Subject, then the tree.
+            let leaf = wire_shown(text);
+            assert_literal(key_of(&items[4]), &leaf);
+            assert_literal(key_of(&items[5]), &leaf);
+            let children = &items[5].as_obj().unwrap().children;
+            assert_literal(key_of(&children[0]), &leaf);
+        }
+    }
+
+    /// What a whole-row `<input>` on the wire shows: the text of the leaf. Anything
+    /// else shows as sent.
+    fn wire_shown(text: &str) -> String {
+        text.strip_prefix("<input>")
+            .and_then(|t| t.strip_suffix("</input>"))
+            .unwrap_or(text)
+            .to_owned()
+    }
+
+    /// Replying must not carry a stranger's `<button>send</button>` into a form where
+    /// pressing it would send, and what they wrote must leave as they wrote it.
+    #[test]
+    fn a_reply_to_a_tree_keeps_it_inert_and_sends_it_unchanged() {
+        for action in ["reply", "forward"] {
+            for text in HOSTILE.into_iter().filter(|t| !t.ends_with('\\')) {
+                let leaf = format!("<input>{text}</input>");
+                let tree = vec![
+                    FfonElement::new_str(text.to_owned()),
+                    FfonElement::new_str(leaf.clone()),
+                ];
+                let mut msg = make_message(1);
+                msg.from = text.to_owned();
+                msg.to = text.to_owned();
+                msg.subject = text.to_owned();
+                msg.date = text.to_owned();
+                msg.body = MailBody::Ffon(tree);
+                let p = reply_to(msg, action);
+                let MailBody::Ffon(rows) = &p.compose.draft.body else {
+                    panic!("structured: {:?}", p.compose.draft.body);
+                };
+                let n = rows.len();
+                if wire_shown(text) == text {
+                    assert_literal(key_of(&rows[n - 2]), text);
+                } else {
+                    assert_field(key_of(&rows[n - 2]), &wire_shown(text));
+                }
+                assert_field(key_of(&rows[n - 1]), text);
+                for row in rows.iter().map(key_of) {
+                    assert!(!sicompass_sdk::markup::has_markup(row), "{row:?}");
+                    assert!(!tags::has_button(row), "{row:?}");
+                    assert!(sicompass_sdk::markup::targets(row).is_empty(), "{row:?}");
+                }
+
+                let wire = escape::wire_rows(rows);
+                assert_eq!(key_of(&wire[n - 2]), text);
+                assert_eq!(key_of(&wire[n - 1]), leaf);
+                let header = if action == "reply" {
+                    format!("<input>On {text} <{text}> wrote:</input>")
+                } else {
+                    format!("<input>From: {text}</input>")
+                };
+                assert!(
+                    wire.iter().any(|e| key_of(e) == header),
+                    "{header} in {wire:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reply_to_a_link_from_html_quotes_the_url_as_text() {
+        let mut msg = make_message(1);
+        msg.body = MailBody::Text(escape::marked_text("see <link>https://e.com/</link>"));
+        let row_shown = build_message_view(&msg);
+        assert_eq!(
+            sicompass_sdk::markup::targets(key_of(&row_shown[4]))[0].value,
+            "https://e.com/"
+        );
+        let p = reply_to(msg, "reply");
+        let MailBody::Text(s) = &p.compose.draft.body else {
+            panic!("text");
+        };
+        assert!(s.ends_with("> see https://e.com/\n"), "{s:?}");
+    }
+
+    /// Reported, not worked around: the SDK's scanner reads `\</input>` as an escaped
+    /// closing tag, so a value ending in a backslash leaves a row that shows and reads
+    /// back correctly and makes nothing live, but which the app does not take for a
+    /// field. See the ignored test below for what it should be.
+    #[test]
+    fn a_value_ending_in_a_backslash_is_inert_and_reads_back() {
+        let text = r"ends in a backslash\";
+        let row = text_leaf(text);
+        let row = row.as_str().unwrap();
+        assert!(!sicompass_sdk::markup::has_markup(row));
+        assert!(sicompass_sdk::markup::targets(row).is_empty());
+        assert_eq!(tags::strip_display(row), text);
+        assert_eq!(escape::unescape(&tags::extract_input(row).unwrap()), text);
+    }
+
+    #[test]
+    fn a_value_ending_in_a_backslash_is_still_a_field() {
+        let row = text_leaf(r"ends in a backslash\");
+        assert!(tags::has_input(row.as_str().unwrap()), "{row:?}");
     }
 }
 
