@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Everything in a message is shown exactly as written. HTML mail becomes plain text with only http and https links live, and no picture or form control. A sent message keeps its own bytes.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - Mail is fetched and sent in the background again, folders are listed while
