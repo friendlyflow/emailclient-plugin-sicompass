@@ -6,6 +6,5 @@ graphify-out/
 .cache
 .vscode
 .claude/settings.local.json
-plugin.wasm
 dist/
 build/
